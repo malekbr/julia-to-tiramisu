@@ -25,7 +25,7 @@ THE POSSIBILITY OF SUCH DAMAGE.
 
 module Driver
 
-export accelerate, toDomainIR, toParallelIR, toFlatParfors, toJulia, toCGen, toCartesianArray, runStencilMacro, captureOperators, expandParMacro, extractCallGraph
+export accelerate, toDomainIR, toParallelIR, toFlatParfors, toJulia, toCGen, toTiramisu, toCartesianArray, runStencilMacro, captureOperators, expandParMacro, extractCallGraph
 
 using CompilerTools
 using CompilerTools.AstWalker
@@ -328,8 +328,8 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
       run_where = 0
   elseif ParallelAccelerator.getPseMode() == ParallelAccelerator.OFFLOAD2_MODE
       run_where = 1
-#  elseif ParallelAccelerator.getPseMode() == ParallelAccelerator.TASK_MODE
-#      pert_init(package_root, false)
+  #  elseif ParallelAccelerator.getPseMode() == ParallelAccelerator.TASK_MODE
+  #      pert_init(package_root, false)
   else
       throw("PSE mode error")
   end
@@ -404,6 +404,11 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
   off_time = time_ns() - off_time_start
   @dprintln(1, "accelerate: accelerate conversion time = ", ns_to_sec(off_time))
   return proxy_func
+end
+
+function toTiramisu(func :: GlobalRef, code, signature :: Tuple)
+  println("In Tiramisu")
+  return code
 end
 
 function code_typed(func, signature)

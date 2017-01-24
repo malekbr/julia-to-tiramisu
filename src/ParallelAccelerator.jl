@@ -45,6 +45,10 @@ const OFFLOAD2_MODE = 3
 const TASK_MODE = 4
 const THREADS_MODE = 5
 
+const USE_CGEN = 0
+const USE_TIRAMISU = 1
+const USE_BOTH = 2
+
 num_acc_allocs = 0
 num_acc_parfors = 0
 
@@ -100,6 +104,26 @@ function getPseMode()
     TASK_MODE
   elseif mode == "threads"
     THREADS_MODE
+  else
+    error(string("Unknown PROSPECT_MODE = ", mode))
+  end
+end
+
+"""
+Return how we should use Tirmisu by looking up environment variable "TIRAMISU_MODE".
+"""
+function getTiramisuMode()
+  if haskey(ENV,"TIRAMISU_MODE")
+     mode = ENV["TIRAMISU_MODE"]
+  else
+     mode = "cgen"
+  end
+  if mode == "cgen"
+    USE_CGEN
+  elseif mode == "tiramisu"
+    USE_TIRAMISU 
+  elseif mode == "both"
+    USE_BOTH
   else
     error(string("Unknown PROSPECT_MODE = ", mode))
   end
@@ -300,7 +324,12 @@ function __init__()
       addOptPass(toDomainIR, PASS_TYPED)
       addOptPass(toParallelIR, PASS_TYPED)
       addOptPass(toFlatParfors, PASS_TYPED)
-      if getPseMode() == THREADS_MODE
+      if (getTiramisuMode() == USE_TIRAMISU)
+        addOptPass(toTiramisu, PASS_TYPED)
+      elseif (getTiramisuMode() == USE_BOTH)
+        addOptPass(toTiramisu, PASS_TYPED)
+        addOptPass(toCGen, PASS_TYPED)
+      elseif getPseMode() == THREADS_MODE
         addOptPass(toJulia, PASS_TYPED)
       else
         addOptPass(toCGen, PASS_TYPED)
