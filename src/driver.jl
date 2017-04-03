@@ -408,6 +408,197 @@ end
 
 function toTiramisu(func :: GlobalRef, code, signature :: Tuple)
   println("In Tiramisu")
+  if ParallelAccelerator.getPseMode() == ParallelAccelerator.THREADS_MODE
+    return code
+  end
+  
+  off_time_start = time_ns()
+  #=
+  package_root = ParallelAccelerator.getPackageRoot()
+  function_name_string = ParallelAccelerator.CGen.canonicalize(string(func.name))
+
+  array_types_in_sig = Dict{DataType,Int64}()
+  atiskey = 1;
+  for t in signature
+      if isStringType(t)
+          array_types_in_sig[Array{UInt8, 1}] = atiskey
+          atiskey += 1
+      else
+          while isArrayType(t)
+              array_types_in_sig[t] = atiskey;
+              atiskey += 1
+              t = eltype(t)
+          end
+      end
+  end
+  @dprintln(3, "array_types_in_sig from signature = ", array_types_in_sig)
+
+  if isa(code, Tuple)
+    LambdaVarInfo, body = code
+  else
+    LambdaVarInfo, body = lambdaToLambdaVarInfo(code)
+  end
+  ret_type = getReturnType(LambdaVarInfo)
+  # TO-DO: Check ret_type if it is Any or a Union in which case we probably need to abort optimization in CGen mode.
+  ret_typs = isTupleType(ret_type) ? [ (convert_to_Julia_typ(x), isArrayOrStringType(x)) for x in ret_type.parameters ] : [ (convert_to_Julia_typ(ret_type), isArrayOrStringType(ret_type)) ]
+
+  # Add arrays from the return type to array_types_in_sig.
+  for rt in ret_typs
+      t = rt[1]
+      if isStringType(t)
+          array_types_in_sig[Array{UInt8,1}] = atiskey
+          atiskey += 1
+      else
+          while isArrayType(t)
+              array_types_in_sig[t] = atiskey;
+              atiskey += 1
+              t = eltype(t)
+          end
+      end
+  end
+  @dprintln(3, "array_types_in_sig including returns = ", array_types_in_sig)
+ 
+  outfile_name = CGen.writec(CGen.from_root_entry(code, function_name_string, signature, array_types_in_sig))
+  =
+  CGen.compile(outfile_name)
+  dyn_lib = CGen.link(outfile_name)
+  full_outfile_name = "$package_root/deps/generated/$outfile_name.cpp"
+  full_outfile_base = "$package_root/deps/generated/$outfile_name"
+ 
+  # The proxy function name is the original function name with "_j2c_proxy" appended.
+  proxy_name = string("_",function_name_string,"_j2c_proxy")
+  proxy_sym = gensym(proxy_name)
+  @dprintln(2, "toCGen for ", proxy_name)
+  @dprintln(2, "C File  = ", full_outfile_name)
+  @dprintln(2, "dyn_lib = ", dyn_lib)
+  
+  # This is the name of the function that j2c generates.
+  j2c_name = string("_",function_name_string,"_")
+  
+
+  # Convert Arrays in signature to Ptr and add extra arguments for array dimensions
+  (modified_sig, sig_dims) = convert_sig(signature)
+  @dprintln(2, "modified_sig = ", modified_sig)
+  @dprintln(2, "sig_dims = ", sig_dims)
+  original_args = CompilerTools.LambdaHandling.getInputParameters(LambdaVarInfo)
+  @dprintln(3, "len? ", length(original_args), length(sig_dims))
+ 
+  map!(s -> gensym(string(s)), original_args)
+  assert(length(original_args) == length(sig_dims))
+  modified_args = Array(Any, length(sig_dims))
+  extra_inits = Array(Any, 0)
+  j2c_array = gensym("j2c_arr")
+
+  j2c_array_new = 
+    # Create a new j2c array object with element size in bytes and given dimension.
+    # It will share the data pointer of the given inp array, and if inp is nothing,
+    # the j2c array will allocate fresh memory to hold data.
+    # NOTE: when elem_bytes is 0, it means the elements must be j2c array type
+    @eval (elem_bytes::Int, inp::Union{Array, Void}, ndim::Int, dims::Tuple) -> begin
+      # note that C interface mandates Int64 for dimension data
+      _dims = Int64[ convert(Int64, x) for x in dims ]
+      _inp = is(inp, nothing) ? C_NULL : convert(Ptr{Void}, pointer(inp))
+
+      #ccall((:j2c_array_new, $dyn_lib), Ptr{Void}, (Cint, Ptr{Void}, Cuint, Ptr{UInt64}),
+      #      convert(Cint, elem_bytes), _inp, convert(Cuint, ndim), pointer(_dims))
+      ccall((:j2c_array_new, $dyn_lib), Ptr{Void}, (Cint, Ptr{Void}, Cuint, Ptr{UInt64}),
+            convert(Cint, elem_bytes), _inp, convert(Cuint, ndim), pointer(_dims))
+    end
+
+  for i = 1:length(sig_dims)
+    arg = original_args[i]
+    if sig_dims[i] > 0 
+      j = length(extra_inits) + 1
+      push!(extra_inits, :(to_j2c_array($arg, ptr_array_dict, $array_types_in_sig, $j2c_array_new)))
+      modified_args[i] = :($(j2c_array)[$j])
+    else
+      modified_args[i] = arg
+    end
+  end
+  
+  # Create a set of expressions to pass as arguments to specify the array dimension sizes.
+  if ParallelAccelerator.getPseMode() == ParallelAccelerator.HOST_MODE
+      run_where = -1
+  elseif ParallelAccelerator.getPseMode() == ParallelAccelerator.OFFLOAD1_MODE
+      run_where = 0
+  elseif ParallelAccelerator.getPseMode() == ParallelAccelerator.OFFLOAD2_MODE
+      run_where = 1
+  #  elseif ParallelAccelerator.getPseMode() == ParallelAccelerator.TASK_MODE
+  #      pert_init(package_root, false)
+  else
+      throw("PSE mode error")
+  end
+  
+  num_rets = length(ret_typs)
+  ret_arg_exps = Array(Any, 0)
+  extra_sig = Array(Type, 0)
+  # We special-case functions that return Void/nothing since it is common.
+  Void_return = (num_rets == 1 && ret_typs[1][1] == Void)
+  if !Void_return
+      for i = 1:num_rets
+          (typ, is_array) = ret_typs[i]
+          push!(extra_sig, is_array ? Ptr{Ptr{Void}} : Ptr{typ})
+          push!(ret_arg_exps, Expr(:call, GlobalRef(Base, :pointer), Expr(:call, GlobalRef(Base, :arrayref), :ret_args, i)))
+          #push!(ret_arg_exps, Expr(:call, TopNode(:pointer), Expr(:call, TopNode(:arrayref), toRHSVar(:ret_args, Array{Any,1}, LambdaVarInfo), i)))
+      end
+  end
+  
+  @dprintln(2,"signature = ", signature, " -> ", ret_typs)
+  @dprintln(2,"modified_args = ", typeof(modified_args), " ", modified_args)
+  @dprintln(2,"extra_sig = ", extra_sig)
+  @dprintln(2,"ret_arg_exps = ", ret_arg_exps)
+  tuple_sig_expr = Expr(:tuple,Cint,modified_sig...,extra_sig...)
+  @dprintln(2,"tuple_sig_expr = ", tuple_sig_expr)
+  proxy_func = @eval function ($proxy_sym)($(original_args...))
+      # As we convert arrays into pointers that are stored in j2c_array objects, we remember in this
+      # dictionary a mapping between an array's data pointer and the array object itself.  Later,
+      # when processing arrays returned by the function, we see if some data pointer returned is
+      # equal to one of the pointers in the ptr_array_dict.  If so, then the C code has returned an
+      # array we passed to it as input and so from_j2c_array will get the original array from
+      # ptr_array_dict and will alias to the returned array.
+      ptr_array_dict = Dict{Ptr{Void},Array}()
+      #@dprintln(2,"Running proxy function.")
+      ret_args = Array(Any, $num_rets)
+      for i = 1:$num_rets
+        (t, is_array) = $(ret_typs)[i]
+        if is_array
+          t = Ptr{Void}
+        end
+        ret_args[i] = Array(t, 1) # hold return result
+      end
+      $(j2c_array) = [ $(extra_inits...) ]
+      #j2c_array_typs = Any[ typeof(x) for x in $(extra_inits...) ]
+      #@dprintln(3, "before ccall: ret_args = ", Any[$(ret_arg_exps...)])
+      #@dprintln(3, "before ccall: modified_args = ", Any[$(modified_args...)])
+      ccall(($j2c_name, $dyn_lib), Void, $tuple_sig_expr, $run_where, $(modified_args...), $(ret_arg_exps...))
+      result = Array(Any, $num_rets)
+      for i = 1:$num_rets
+        (t, is_array) = $(ret_typs)[i]
+        dprintln(3, "ret=", ret_args[i][1], "t=", t, " is_array=", is_array)
+        if is_array
+          if isStringType(t)
+             result[i] = convert(t, from_ascii_string(ret_args[i][1], ptr_array_dict))
+          else
+             result[i] = from_j2c_array(ret_args[i][1], eltype(t), ndims(t), ptr_array_dict)
+             if isBitArrayType(t)
+                 result[i] = convert(BitArray, result[i])
+             end
+          end
+        else
+          result[i] = convert(t, (ret_args[i][1]))
+        end
+      end
+      # free j2c arrays FIXME: needs a better delete for nested arrays
+      for i = 1:length($(j2c_array))
+        j2c_array_delete($(j2c_array)[i])
+      end
+      # If the function returns nothing then just force it here since cgen code can't return it.
+      return ($num_rets == 1 ? ($Void_return ? nothing : result[1]) : tuple(result...))
+  end
+
+  return proxy_func=#  
+  off_time = time_ns() - off_time_start
+  @dprintln(1, "accelerate: accelerate conversion time = ", ns_to_sec(off_time))
   return code
 end
 
