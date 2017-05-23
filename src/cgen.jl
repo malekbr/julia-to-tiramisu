@@ -104,7 +104,6 @@ const USE_GCC = 1
 const USE_MINGW = 2
 USE_OMP = 1
 CGEN_RAW_ARRAY_MODE = false
-DEBUG_MODE = false
 
 function set_raw_array_mode(mode=true)
     global CGEN_RAW_ARRAY_MODE = mode
@@ -342,7 +341,6 @@ function getenv(var::AbstractString)
 end
 
 include("cgen-pattern-match.jl")
-include("cgen-tiramisu.jl")
 
 # Emit declarations and "include" directives
 function from_header(isEntryPoint::Bool, linfo)
@@ -693,13 +691,6 @@ function from_assignment(args::Array{Any,1}, linfo)
     end
 
     lhsO = from_expr(lhs, linfo)
-    if string(lhsO) == "A"
-        global DEBUG_MODE
-        DEBUG_MODE = true
-    else
-        global DEBUG_MODE
-        DEBUG_MODE = false
-    end
     rhsO = from_expr(rhs, linfo)
     if lhsO == rhsO # skip x = x due to issue with j2c_array
         return ""
@@ -1538,6 +1529,7 @@ function resolveCallTarget(ast::Array{Any, 1},linfo)
     # julia doesn't have GetfieldNode anymore
     #if isdefined(:GetfieldNode) && isa(args[1],GetfieldNode) && isa(args[1].value,Module)
     #   M = args[1].value; s = args[1].name; t = ""
+
     @dprintln(3,"Trying to resolve target from ast::Array{Any,1} with args: ", ast)
     return resolveCallTarget(ast[1], ast[2:end],linfo)
 end
@@ -2425,7 +2417,6 @@ function fromRHSVar(ast::GenSym, linfo)
 end
 
 function from_expr(ast::Union{Symbol,RHSVar}, linfo)
-    #println("Union")
     sym = lookupVariableName(ast, linfo)
     fromRHSVar(sym, linfo)
 end
@@ -2443,23 +2434,19 @@ function from_expr(ast::GotoNode, linfo)
 end
 
 function from_expr(ast::TopNode, linfo)
-    #println("Top")
     s = from_topnode(ast, linfo)
 end
 
 function from_expr(ast::QuoteNode, linfo)
-    #println("Quote")
     # All QuoteNode should have been explicitly handled, otherwise we translate the value inside
     return from_expr(ast.value, linfo)
 end
 
 function from_expr(ast::NewvarNode, linfo)
-    #println("NewVar")
     s = from_newvarnode(ast, linfo)
 end
 
 function from_expr(ast::GlobalRef, linfo)
-    #println("Global")
     s = from_globalref(ast, linfo)
 end
 
@@ -2484,7 +2471,6 @@ function from_expr(ast::Char, linfo)
 end
 
 function from_expr(ast::Union{Int8,UInt8,Int16,UInt16,Int32,UInt32,Int64,UInt64,Float16, Float32,Float64,Bool,Char,Void}, linfo)
-    #println("BigUnion")
     if is(ast, Inf)
       "DBL_MAX"
     elseif is(ast, Inf32)
@@ -3000,18 +2986,8 @@ function from_root_entry(ast, functionName::AbstractString, argtyps, array_types
     s *= emitunaliasedroots ? "$rtyp $(functionName)_unaliased($argsunal)\n{\n$bod\n}\n" : ""
     setFunctionCompiled(functionName, argtyps)
     forwards, funcs = from_worklist()
-    hdr = from_header(true,linfo)
+    hdr = from_header(true, linfo)
     c = hdr * forwards * funcs * s * wrapper
-
-    #TIRAMISU_CODE
-    thdr = tiramisu_from_header(linfo)
-    twrap = tiramisu_set_function(functionName)
-    tbod = tiramisu_from_expr(body,linfo)
-    tc = thdr * twrap* tbod * "}\n"
-    cfff = open("/home/david/generated/thello.cpp","w")
-    write(cfff, s)
-    close(cfff)
-
     resetLambdaState(lstate)
 
     gen_j2c_array_new = "extern \"C\"\nvoid *j2c_array_new(int key, void*data, unsigned ndim, int64_t *dims) {\nvoid *a = NULL;\nswitch(key) {\n"
@@ -3023,7 +2999,7 @@ function from_root_entry(ast, functionName::AbstractString, argtyps, array_types
     gen_j2c_array_new *= "default:\nfprintf(stderr, \"j2c_array_new called with invalid key %d\", key);\nassert(false);\nbreak;\n}\nreturn a;\n}\n"
     c *= gen_j2c_array_new
     flush(STDOUT)
-    c,tc
+    c
 end
 
 # This is the entry point to CGen from the PSE driver
@@ -3167,15 +3143,9 @@ function writec(s, outfile_name=nothing; with_headers=false)
     end
     cgenOutput = "$generated_file_dir/$outfile_name.cpp"
     cf = open(cgenOutput, "w")
-    write(cf, s[1])
+    write(cf, s)
     @dprintln(3,"Done committing CGen code")
     close(cf)
-    cfff = open("/home/david/generated/hello.cpp","w")
-    write(cfff, s[1])
-    close(cfff)
-    cfff = open("/home/david/generated/thello.cpp","w")
-    write(cfff, s[2])
-    close(cfff)
     return outfile_name
 end
 
@@ -3390,8 +3360,6 @@ function compile(outfile_name; flags=[])
         compileCommand = getCompileCommand(full_outfile_name, cgenOutput, flags)
         @dprintln(1,"Compilation command = ", compileCommand)
         run(compileCommand)
-        run(tiramisu_get_command())
-        run(tiramisu_get_gen())
     end
 end
 
@@ -3495,7 +3463,7 @@ function link(outfile_name; flags=[])
 
     if !isDistributedMode() || MPI.Comm_rank(MPI.COMM_WORLD)==0
         linkCommand = getLinkCommand(outfile_name, lib, flags)
-        println(1,"Link command = ", linkCommand)
+        @dprintln(1,"Link command = ", linkCommand)
         run(linkCommand)
         @dprintln(3,"Done CGen linking")
     end
