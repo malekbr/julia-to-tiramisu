@@ -8,12 +8,12 @@
 #   - Then, each Tiramisu AST node is passed into a tiramisu_translate
 #     method to generate the proper Tiramisu C++ code.
 #
-# Optional passes could be added in the future in between the two steps 
-# to perform other optimizations (eliminate redundant buffers, evaluate 
+# Optional passes could be added in the future in between the two steps
+# to perform other optimizations (eliminate redundant buffers, evaluate
 # gotos, etc)
 #
 # tiramisu_from_root_entry is the entry point where all the magic happens
-# 
+#
 # Originally Created By David Vargas
 #
 
@@ -34,8 +34,8 @@ jToC = Dict(
             UInt16  =>  "uint16_t",
             Int32   =>  "int32_t",
             UInt32  =>  "uint32_t",
-            Int64   =>  "int32_t",
-            UInt64  =>  "uint32_t",
+            Int64   =>  "int64_t",
+            UInt64  =>  "uint64_t",
             Float16 =>  "float",
             Float32 =>  "float",
             Float64 =>  "double",
@@ -51,24 +51,33 @@ jToT = Dict(
             UInt16  =>  "p_uint16",
             Int32   =>  "p_int32",
             UInt32  =>  "p_uint32",
-            Int64   =>  "p_int32",
-            UInt64  =>  "p_uint32",
+            Int64   =>  "p_int64",
+            UInt64  =>  "p_uint64",
             Float16 =>  "p_float32",
             Float32 =>  "p_float32",
             Float64 =>  "p_float64",
             Bool    =>  "p_boolean"
     ) #Map from Julia types to Tiramisu types
 
+Primitive = Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64,
+                  Float16, Float32, Float64, Bool}
+
+
 #TODO: Edit these constants to match the proper directory of all the following
-const HALIDE_INCLUDE_DIR = "/home/david/tiramisu/Halide/include"
-const HALIDE_TOOLS_DIR = "/home/david/tiramisu/Halide/tools"
-const TIRAMISU_INCLUDE_DIR = "/home/david/tiramisu/include"
-const TIRAMISU_BUILD_DIR = "/home/david/tiramisu/build"
+const HALIDE_INCLUDE_DIR = "/home/malek/tiramisu/Halide/include"
+const HALIDE_TOOLS_DIR = "/home/malek/tiramisu/Halide/tools"
+const HALIDE_LIB_DIR = "/home/malek/tiramisu/Halide/lib"
+const ISL_INCLUDE_DIR = "/home/malek/tiramisu/isl/build/include"
+const ISL_LIB_DIR = "/home/malek/tiramisu/isl/build/lib"
+const TIRAMISU_INCLUDE_DIR = "/home/malek/tiramisu/include"
+const TIRAMISU_BUILD_DIR = "/home/malek/tiramisu/build"
 
 #The following constants are the output files created
-const FILENAME = "/home/david/generated/thello.cpp"
+const FILENAME = "/home/malek/generated/thello.cpp"
+const FILENAME_WRAPPER = "/home/malek/generated/thello_wrapper.cpp"
 const GEN = "$TIRAMISU_BUILD_DIR/thello_generator"
 const OBJ = "$TIRAMISU_BUILD_DIR/thello.o"
+const OBJ_WRAPPER = "$TIRAMISU_BUILD_DIR/thello_wrapper.o"
 const LIB = "$TIRAMISU_BUILD_DIR/thello.so"
 
 #Globals
@@ -76,21 +85,46 @@ function_name = ""
 computationIndex = 0
 computationPrefix = "S"
 
+@enum TBufferArgument TBOutput TBInput TBTemporary
+argNames = Dict(
+    TBOutput => "a_output",
+    TBInput => "a_input",
+    TBTemporary => "a_temporary",
+)
+@enum TOpStyle TOpFuncCall TOpInfix
+
+abstract TExpr
+
+type TEmptyExpr <: TExpr
+end
+
+type TValue <: TExpr
+    #expr e_p0 = expr((int32_t) SIZE0);
+    name::String
+    val
+    typ::DataType
+end
+
+#The following types are found on lower levels of a Tiramisu AST to help translate,
+#modify, and optimize the Tiramisu AST
+type TOp <: TExpr
+    name::String
+    fcn::String
+    style::TOpStyle
+    args::Array{TExpr, 1}
+    typ::DataType
+end
+
 #The following types are what should be found on the top level of a Tiramisu AST
 type TBuffer
     #buffer buf0("buf0", 2, {tiramisu::expr(10),tiramisu::expr(10)}, p_uint8, NULL, a_output, &function0);
     name
-    dimensions :: Array{Any,1}
+    dimensions :: Array{TExpr,1}
     typ
-    isoutput
+    argument::TBufferArgument
 end
 
-type TExpr
-    #expr e_p0 = expr((int32_t) SIZE0);
-    name
-    val
-    typ
-end
+
 
 type TConstant
     #constant N("N", e_N, p_int32, true, NULL, 0, &function0);
@@ -99,23 +133,25 @@ type TConstant
     typ
 end
 
-type TComputation
-    #computation S0("[N]->{S0[i,j]: 0<=i<N and 0<=j<N}", e3, true, p_uint8, &function0);
-    name
-    space
-    ranges
-    expr
-    typ
-    access
-    setafter :: Bool
+indexNames = "ijklmnop"
+
+type ISLCondition
+    var::String
+    op::String
+    lim::String
 end
 
-#The following types are found on lower levels of a Tiramisu AST to help translate,
-#modify, and optimize the Tiramisu AST
-type TOp
-    fcn
-    args
+type TComputation
+    #computation S0("[N]->{S0[i,j]: 0<=i<N and 0<=j<N}", e3, true, p_uint8, &function0);
+    name::String
+    conditions::Array{ISLCondition}
+    dim::Unsigned
+    expr::TExpr
+    typ::DataType
+#    access
+    is_input::Bool
 end
+
 
 type TRange
     iterator
@@ -134,6 +170,139 @@ type TSignature
     ret
 end
 
+type JVar
+    typ::DataType
+    buffer::TBuffer
+    computation::TComputation
+end
+
+abstract TIndex
+
+type TConstIndex <: TIndex
+    val::Integer
+end
+
+type TVarIndex <: TIndex
+    letter::Unsigned
+end
+
+type TRead <: TExpr
+    var::JVar
+    indices::Vector{TIndex}
+end
+
+vars = Dict{SSAValue, JVar}()
+
+typToTBuffer = Dict(
+    Int64 => function(id, typ)
+        return TBuffer("B"*string(id.id),
+                       [TValue("", 1, Int64)],
+                       Int64,
+                       TBTemporary)
+    end,
+)
+
+function make_counter()
+    counter = -1
+    return function()
+        counter += 1
+        return counter
+    end
+end
+
+computation_counter = make_counter()
+new_computation_id() = "S"*string(computation_counter())
+
+function parseExpr(expr::Expr)
+    return exprHandlers[expr.head](expr)
+end
+
+function parseComputation(expr::Primitive)
+    return TComputation(
+        new_computation_id(),
+        [ISLCondition("i", "=", "0")],
+        1,
+        getRHS(expr),
+        typeof(expr),
+        false # TODO : fix
+    )
+end
+
+function getRHS(node::Primitive)
+    return TValue("", node, typeof(node))
+end
+
+function getRHS(node::SSAValue)
+    if !haskey(vars, node)
+        throw(UndefVarError(Symbol(node)))
+    end
+    return TRead(vars[node], [TConstIndex(0)])
+end
+
+
+callHandlers = Dict(
+    (Core.Intrinsics, :add_int) => function(args, typ)
+        return TComputation(
+            new_computation_id(),
+            [ISLCondition("i", "=", "0")],
+            1,
+            TOp(
+                "",
+                "+",
+                TOpInfix,
+                [getRHS(arg) for arg in args],
+                typ
+            ),
+            typ,
+            false # TODO : fix
+        )
+    end,
+    (Core.Intrinsics, :box) => function(args, typ)
+        return parseExpr(args[2])
+    end
+)
+
+function handleReturn(arg::SSAValue, typ::DataType)
+    vars[expr.args[1]].buffer.argument = TBOutput
+end
+
+function handleReturn(arg, typ::DataType)
+    id = SSAValue(length(vars))
+    buffer = typToTBuffer[typ](id, typ)
+    buffer.argument = TBOutput
+    comp = parseComputation(arg)
+    buffer.argument = TBOutput
+    vars[id] = JVar(typ, buffer, comp)
+end
+
+exprHandlers = Dict(
+    # In case of call, lookup the function in the list of supported functions
+    :call => function(expr)
+        called_function_id = (expr.args[1].mod, expr.args[1].name)
+        return get(callHandlers,
+                   called_function_id,
+                   function(args) end)(expr.args[2:end], expr.typ)
+    end,
+
+    # In case of assignment, create buffer, computation
+    :(=) => function(expr)
+        id = expr.args[1]
+        typ = expr.typ
+
+        vars[id] = JVar(
+            typ,
+            typToTBuffer[typ](id, typ),
+            parseExpr(expr.args[2]),
+        )
+    end,
+
+    # For return, set buffer to output
+    :return => function(expr)
+        assert(length(expr.args) == 1) # TODO support tuples
+        handleReturn(expr.args[1], expr.typ)
+    end,
+)
+
 #IMPORTANT: This is the main entry point for Julia to Tiramisu Translation
 #This functions performs a number of key steps:
 #   -First it gets the header string which includes imports and the namespace
@@ -141,7 +310,7 @@ end
 #    setting Tiramisu default options, and declaring the function to be generated.
 #   -Third it translates the body of the program using the steps outlined in the
 #    beginning. This is where the majority of the work takes place
-#   -Next it writes the combination of this string to a file 
+#   -Next it writes the combination of this string to a file
 #   -Then the file is compiled, run, and converted to a library file
 #   -Finally, the library file name is returned to be used by Julia
 function tiramisu_from_root_entry(body, linfo, functionName::AbstractString)
@@ -149,12 +318,23 @@ function tiramisu_from_root_entry(body, linfo, functionName::AbstractString)
     #Form Tiramisu String
     thdr = tiramisu_from_header(linfo)
     twrap = tiramisu_set_function(functionName)
-    tbod = tiramisu_from_expr(body,linfo)
+    tbod = tiramisu_analyze_body(body, linfo)
     tc = thdr * twrap* tbod * "}\n"
+
+    tcw = generate_wrapper()
+
+
+    println(functionName)
 
     #Write to File
     fil = open(FILENAME,"w")
     write(fil, tc)
+    close(fil)
+    #println("Wrote to file")
+
+    #Write to File
+    fil = open(FILENAME_WRAPPER,"w")
+    write(fil, tcw)
     close(fil)
     #println("Wrote to file")
 
@@ -163,10 +343,15 @@ function tiramisu_from_root_entry(body, linfo, functionName::AbstractString)
     #println("Compiled Tiramisu File")
     run(tiramisu_get_gen())
     #println("Generated Function")
+    run(tiramisu_get_lib_obj())
     run(tiramisu_get_lib())
     #println("Converted to .so file")
-    LIB
+    LIB #, get_return()
 end
+
+# function get_return()
+#     return Vector{}
+# end
 
 #Imports for Tiramisu file
 function tiramisu_from_header(linfo)
@@ -205,502 +390,123 @@ function tiramisu_set_function(f)
                 "\tfunction $function_name(\"$function_name\");\n")
 end
 
-#Entry Point for Transforming and translating Julia AST body into body of
-#Tiramisu program
-function tiramisu_from_expr(ast::Expr, linfo)
-    s = ""
-    head = ast.head
-    args = ast.args
-    typ = ast.typ
+getIndex(index::TConstIndex) = string(index.val)
 
-    if head == :body
-        newargs = tiramisu_transform_body(args,linfo) #Main step 1 from intro
-        s *= tiramisu_translate(newargs) #Main step 2 from intro
+getIndex(index::TVarIndex) = indexNames[index.letter]
+
+getIndices(indices::Vector{TIndex}) = join(map(getIndex, indices), ", ")
+
+createTExpr(val::TValue) = "expr(($(jToC[val.typ])) $(val.val))"
+function createTExpr(var::TRead)
+    "$(var.var.computation.name)(" * getIndices(var.indices) * ")"
+end
+function createTExpr(op::TOp)
+    if op.style == TOpInfix
+        return join(map(createTExpr, op.args), op.fcn)
     end
-    s
+    return op.fcn * "(" * join(map(createTExpr, op.args), ",") * ")"
 end
 
-#Entry Point for the first main step from the Intro. The job of this method is
-#to convert a Julia AST into an array of TIramisu Nodes from the types outlined
-#above. Note not all possible Julia nodes are supported.
-function tiramisu_transform_body(args,linfo)
-    #Uncomment loop below to see Julia ast nodes before converted to Tiramisu
-    #for i in 1:length(args)
-    #    println("transform iteration:", i)
-    #    dump(args[i])
-    #end
-
-    #Start of method transformation
-    newBody = Array{Any}(0)
-    index = 0
-    for i in 1:length(args)
-        println("started iteration ",i," newBody size ",length(newBody))
-        if index >= i
-            continue
-        end
-        if typeof(args[i]) <: Union{LabelNode,GotoNode}
-            #ignore
-            index+=1
-        elseif args[i].head == :(=)
-            lhs = tiramisu_get_var(args[i].args[1],linfo)
-            rhs = tiramisu_eval(args[i].args[2],linfo)
-            if typeof(rhs) <: TExpr && typeof(rhs.val) <: TOp && startswith(rhs.val.fcn,"Matrix")
-                rhs = tiramisu_eval_matrixop(rhs,linfo,newBody)
-                rhs.access.val = lhs#TODO: This is a hack
-            elseif typeof(rhs) <: Union{TExpr,TBuffer}
-                rhs.name = lhs
-            else
-                rhs = TExpr(lhs,string(rhs),Nullable)
-            end
-            #=Hacky deprecated loop that was created for kmeans
-            if rhs.typ <: SlotNumber
-                for j in length(newBody):-1:1
-                    buffercopy = rhs.val
-                    if typeof(newBody[j]) <: TComputation && newBody[j].access.buf == buffercopy
-                        rhs.val = newBody[j]
-                        for k in j:-1:1
-                            if typeof(newBody[k]) <: TBuffer && newBody[k].name == buffercopy
-                                rhs.val.access.ind = newBody[k]
-                                break
-                            end
-                        end
-                        break
-                    end 
-                end
-            end
-            =#
-            push!(newBody,rhs)
-            index += 1
-        elseif args[i].head == :parfor_start
-            loopdepth = 0
-            for j in i:length(args)
-                if isdefined(args[j],:head) && args[j].head == :parfor_end
-                    loopdepth -= 1
-                end
-                if isdefined(args[j],:head) && args[j].head == :parfor_start
-                    loopdepth += 1
-                end
-                if loopdepth == 0
-                    index = j
-                    break
-                end
-            end
-            newarg = tiramisu_eval_parfor(args[i:index],linfo)
-            prevexprs = newarg[1]
-            for j in 1:length(prevexprs)
-                push!(newBody,prevexprs[j])
-            end
-            space = newarg[2][1].space
-            for j in 1:length(space)
-                con = tiramisu_eval_const(space[j],newarg[2][1].name,j)
-                push!(newBody,con)
-                for r in newarg[2][1].ranges
-                    if r.high == space[j]
-                        r.high = con.name
-                    end
-                end
-                space[j] = con.name
-            end
-            newBody = vcat(newBody,newarg[2])
-        elseif args[i].head == :return
-            newarg = tiramisu_eval_return(args[i],linfo)
-            push!(newBody,newarg)
-            for i in length(newBody):-1:1
-                if typeof(newBody[i]) <: TBuffer && newBody[i].name == newarg.ret
-                    newBody[i].isoutput = true
-                    break
-                end
-            end
-            index+= 1
-        elseif args[i].head == :call
-            newarg = tiramisu_eval_call(args[i].args,args[i].typ,linfo)
-            push!(newBody,newarg)
-            index+= 1
-        elseif args[i].head == :meta || args[i].head == :inbounds
-            #ignore
-            index += 1
-        elseif args[i].head == :gotoifnot
-            #ignore
-            index += 1
-        else
-            dump(args[i])
-            println("Tiramisu_transform_body error unknown head ",args[i].head)
-        end
-        #dump(newBody[end])
-    end
-    newBody
+function createISLCond(cond::ISLCondition)
+    return "$(cond.var) $(cond.op) $(cond.lim)"
 end
 
-#The following set of tiramisu_eval_* functions are all used through various points
-#of walking the Julia AST for the above tiramisu_transform_body method.
-
-function tiramisu_eval(ast,linfo)
-    if !isdefined(ast,:head)
-        tiramisu_eval_expr(ast,linfo)
-    elseif ast.head == :call
-        tiramisu_eval_call(ast.args,ast.typ,linfo)
-    end
+function getIndices(comp::TComputation)
+    return join(indexNames[1:comp.dim], ", ")
 end
 
-function tiramisu_eval_parfor(args,linfo)
-    global computationIndex
-    global computationPrefix
-    forstart = args[1]
-    forend = args[end]
-    exprs = args[2:end-1]
-    ln = forstart.args[1].loopNests
-    ranges = []
-    for i in length(ln):-1:1
-        iterator = tiramisu_get_var(ln[i].indexVariable,linfo)
-        push!(ranges,TRange(iterator,ln[i].lower,ln[i].upper))
-    end
-    typ = forstart.typ
-    newexprs = tiramisu_transform_body(exprs,linfo)
-    space = []
-    for r in ranges
-        if !(r.high in space)
-            push!(space,r.high)
-        end
-    end
-    access = []
-    for i in length(newexprs):-1:1
-        if typeof(newexprs[i]) <: TAccess
-            push!(access,newexprs[i])
-            deleteat!(newexprs,i)
-        end
-    end
-    tc = []
-    for i in length(access):-1:1
-        a = access[i]
-        compexpr = TExpr("",nothing,Nullable)
-        compname = computationPrefix*string(computationIndex)
-        computationIndex += 1
-        if length(newexprs) > 0
-            compexpr = newexprs[end]
-            compexpr = TExpr("",compexpr.val,compexpr.typ)
-        elseif a.val != nothing
-            compexpr = TExpr("",a.val,typeof(a.val))
-        end
-        push!(tc,TComputation(compname,space,ranges,compexpr,typ,a,false))
-    end
-    if length(newexprs)>0
-        return [newexprs,tc]
-    else
-        return [[],tc]
-    end
+function createISL(comp::TComputation)
+    indices_used = getIndices(comp)
+    return "{$(comp.name)[$indices_used] : " * join(
+        map(createISLCond, comp.conditions), " and ") * "}"
 end
 
-function tiramisu_eval_return(arg,linfo)
-    ret = tiramisu_get_var(arg.args[1],linfo)
-    params = linfo.input_params
-    sig = TSignature(params,ret)
-    if length(params) == 0
-        push!(sig.args,sig.ret)
-    else
-        #TODO set args to params
+function tiramisu_analyze_body(ast::Expr, linfo)
+    for expr in ast.args
+        dump(expr)
+        parseExpr(expr)
     end
-    sig
+    # computation pass
+    lines = Vector{String}()
+    for (id, var) in vars
+        push!(lines,
+              "tiramisu::computation $(var.computation.name)(" *
+              "\"" * createISL(var.computation) * "\", " *
+              createTExpr(var.computation.expr) * ", " *
+              string(!var.computation.is_input) * ", " *
+              jToT[var.computation.typ] * ", " *
+              "&$function_name);")
+    end
+    for (id, var) in vars
+        push!(lines,
+              "tiramisu::buffer $(var.buffer.name)(" *
+              "\"$(var.buffer.name)\", " *
+              string(length(var.buffer.dimensions)) * ", " *
+              "{" * join(map(createTExpr, var.buffer.dimensions), ", ") * "}, " *
+              jToT[var.buffer.typ] * ", " *
+              "NULL, " *
+              argNames[var.buffer.argument] * ", ",
+              "&$function_name);")
+        push!(lines,
+              "$(var.computation.name).set_access(\"{$(var.computation.name)[" *
+                getIndices(var.computation) * "] -> " *
+                "$(var.buffer.name)[" *
+                getIndices(var.computation) * "]}\");")
+    end
+    interface = [var.buffer.name for (id, var) in vars if var.buffer.argument != TBTemporary]
+    push!(lines, "$function_name.set_arguments({" *
+                  join(map(s -> "&" * s, interface), ", ")
+                  *"});")
+    push!(lines, "$function_name.gen_time_space_domain();")
+    push!(lines, "$function_name.gen_isl_ast();")
+    push!(lines, "$function_name.gen_halide_stmt();")
+    push!(lines, "$function_name.gen_halide_obj(\"$OBJ\");")
+    push!(lines, "return 0;")
+    return join(lines, '\n')
 end
 
-function tiramisu_eval_call(args,typ,linfo)
-    if args[1].name == :ccall
-        dims = args[7:2:end]
-        dimensions = Array{Any,1}(length(dims))
-        for i in 1:length(dims)
-            dimensions[i] = tiramisu_eval(dims[i],linfo)
-        end
-        TBuffer("",dimensions,typ.parameters[1],false)
-    elseif args[1].name == :box
-        tiramisu_eval_call(args[3].args,typ,linfo)
-    elseif args[1].name == :checked_trunc_sint
-        TExpr("",args[3],args[2])
-    elseif args[1].name == :+ || args[1].name == :add_int || args[1].name == :checked_sadd_int
-        TExpr("",TOp("+",[tiramisu_eval_expr(args[2],linfo), tiramisu_eval_expr(args[3],linfo)]),typ)
-    elseif args[1].name == :sle_int || args[1].name == :lt_float
-        TExpr("",TOp("<",[tiramisu_eval_expr(args[2],linfo), tiramisu_eval_expr(args[3],linfo)]),typ)
-    elseif args[1].name == :xor_int
-        TExpr("",TOp("^",[tiramisu_eval_expr(args[2],linfo), tiramisu_eval_expr(args[3],linfo)]),typ)
-    elseif args[1].name == :div_float
-        TExpr("",TOp("/",[tiramisu_eval_expr(args[2],linfo), tiramisu_eval_expr(args[3],linfo)]),typ)
-    elseif args[1].name == :not_int
-        TExpr("",TOp("!",[tiramisu_eval_expr(args[2],linfo)]),typ)
-    elseif args[1].name == :flipsign_int
-        TExpr("",TOp("-",[tiramisu_eval_expr(args[2],linfo)]),typ)
-    elseif args[1].name == :(===)
-        TExpr("",TOp("==",[tiramisu_eval_expr(args[2],linfo), tiramisu_eval_expr(args[3],linfo)]),typ)
-    elseif args[1].name == :arraysize
-        TExpr("",50000,Int64) #TODO: Hardcoded adjust this
-    elseif args[1].name == :sub_int || args[1].name == :sub_float || args[1].name == :checked_ssub_int
-        TExpr("",TOp("-",[tiramisu_eval_expr(args[2],linfo), tiramisu_eval_expr(args[3],linfo)]),typ)
-    elseif args[1].name == :select_value
-        TExpr("",1,Int64) #TODO: Fix
-    elseif args[1].name == :rand
-        TExpr("","((double)rand()/(RAND_MAX))",Float64)
-    elseif args[1].name == :sqrt
-        TExpr("",TOp("sqrt(",[tiramisu_eval_expr(args[2],linfo)]),typ)
-    elseif args[1].name == :powi_llvm
-        TExpr("",TOp("pow(",[tiramisu_eval_expr(args[2],linfo), tiramisu_eval_expr(args[3],linfo)]),typ)
-    elseif args[1].name == :unsafe_arrayref ||  args[1].name == :arrayref
-        ref = tiramisu_get_var(args[2],linfo)*"("*join(map(x->"var(\""*tiramisu_get_var(x,linfo)*"\")",args[3:end]),",")*")"
-        TExpr("",ref,SSAValue)
-    elseif args[1].name == :unsafe_arrayset || args[1].name == :arrayset
-        tiramisu_eval_access(args[2:end],linfo)
-    elseif args[1].name == :getfield || args[1].name == :setfield! 
-        TExpr("",1,Int64) #TODO: Fix
-    elseif args[1].name == :arraylen
-        TExpr("",TOp("get_dim_sizes()",[tiramisu_eval_expr(args[2],linfo)]),typ) #TODO: Fix
-    elseif args[1].name == :sitofp
-        TExpr("",tiramisu_eval_expr(args[3],linfo),args[2])
-    elseif args[1].name == :generic_matmatmul!
-        TExpr("",TOp("Matrix*",args[2:end]),typ)
-    else
-        println("Tiramisu_eval_call error unknown name ",args[1].name)
-        dump(args)
-        TExpr("",args[3],args[2])
-    end
+function buffer_to_arg_prototype(buffer)
+    return (jToC[buffer.typ] *
+            repeat("*", length(buffer.dimensions)) *
+            " $(buffer.name)")
 end
 
-function tiramisu_eval_const(val,compname,i)
-    TConstant(compname*"N"*string(i),TExpr("",val,typeof(val)),typeof(val))
+function buffer_to_halide_buffer(buffer)
+    return ("Halide::Buffer<$(jToC[buffer.typ])> " *
+            "$(buffer.name)_halide($(buffer.name), " *
+            join(map(d -> "$(d.val)", buffer.dimensions), ", ") *
+            ");")
 end
 
-function tiramisu_eval_expr(ast::Union{Int64,Int32,Float64,Float32,Float16,Int16,Int8},linfo)
-    val = eval(ast)
-    TExpr("",val,typeof(val))
+function buffer_to_raw_buffer(buffer)
+    return "$(buffer.name)_halide.raw_buffer()"
 end
 
-function tiramisu_eval_expr(ast::Union{SlotNumber,SSAValue,TypedSlot},linfo)
-    TExpr("",tiramisu_get_var(ast,linfo),typeof(ast))
+function generate_wrapper()
+    # computation pass
+    lines = Vector{String}()
+    push!(lines, "#include \"Halide.h\"")
+    push!(lines, "#include <tiramisu/utils.h>")
+    push!(lines, "#include <cstdlib>")
+    push!(lines, "")
+    push!(lines, "int main(int, char**) {")
+    push!(lines, "return 0;")
+    push!(lines, "}")
+    interface = [var.buffer for (id, var) in vars if var.buffer.argument != TBTemporary]
+    push!(lines, "extern \"C\" void $(function_name)_wrapper(" *
+                  join(map(buffer_to_arg_prototype, interface), ", ") *
+                  ") {")
+    for buffer in interface
+        push!(lines, buffer_to_halide_buffer(buffer))
+    end
+    push!(lines, "$function_name(" *
+                  join(map(buffer_to_raw_buffer, interface), ", ") *
+                  ");")
+    push!(lines, "}")
+    return join(lines, '\n')
 end
 
-function tiramisu_eval_access(args,linfo)
-    ta = TAccess("",[],nothing)
-    ta.buf = tiramisu_get_var(args[1],linfo)
-    if typeof(args[2]) <: Union{Int64,Int32,Float64,Float32,Float16,Int16,Int8}
-        ta.val = args[2]
-    else
-        ta.val = tiramisu_get_var(args[2],linfo)
-    end
-    ta.ind = map(x -> tiramisu_get_var(x,linfo),args[3:end])
-    ta
-end
 
-function tiramisu_eval_matrixop(ast, linfo, newBody)
-    global computationIndex
-    global computationPrefix
-    op = ast.val.fcn[7:end]
-    outputBufName = tiramisu_get_var(ast.val.args[1],linfo)
-    inputBufNames = []
-    for arg in ast.val.args[2:end]
-        if typeof(arg) <: Union{SSAValue,SlotNumber}
-            push!(inputBufNames,tiramisu_get_var(arg,linfo))
-        end
-    end
-    inputComps = []
-    for i in length(newBody):-1:1
-        if typeof(newBody[i]) <: TComputation && newBody[i].access.buf in inputBufNames
-            insert!(inputComps,1,newBody[i])
-        end
-        if length(inputComps) == length(inputBufNames)
-            break
-        end
-    end
-    compname = computationPrefix*string(computationIndex)
-    computationIndex += 1
-    if op == "*"
-        space = inputComps[1].space
-        ranges = copy(inputComps[1].ranges)
-        tempIndex = compname*"_i"
-        push!(ranges,TRange(tempIndex,ranges[1].low,ranges[1].high))
-        left = inputComps[1]
-        right = inputComps[2]
-        compexprOp = TOp("*",[left.name*"(var(\""*left.ranges[1].iterator*"\"),var(\""*tempIndex*"\"))",right.name*"(var(\""*tempIndex*"\"),var(\""*right.ranges[2].iterator*"\"))"])
-        compexpr = TExpr(compname*"_e",compexprOp,ast.typ)
-        access = TAccess(outputBufName,map(x->x.iterator,left.ranges),nothing)
-        outputComp = TComputation(compname,space,ranges,compexpr,left.typ,access,true)
-        return outputComp
-    end
-end
-
-#The end of tiramisu_eval_* methods needed for AST transformation
-
-#Entry point for the second main step from the Intro. Takes the array of 
-#Tiramisu nodes and translates each one into its proper c++ code. There
-#should be no AST manipulation after this point, just read and translation. 
-function tiramisu_translate(statements::Array)
-    #Uncomment loop below to see each Tiramisu node before string translation
-    #for i in 1:length(statements)
-    #    println("translate iteration:",i)
-    #    dump(statements[i])
-    #end
-
-    #Beginning of translation
-    s = ""
-    for i in 1:length(statements)
-        stmt = statements[i]
-        #println("iteration:",i)
-        #println(tiramisu_translate(stmt))
-        #s *= "\tprintf(\"Done$i\\n\");\n" #Uncomment this line to add debug lines in Tiramisu file
-        s*=tiramisu_translate(stmt)
-    end
-    s
-end
-
-function tiramisu_translate(stmt::TConstant)
-    #constant N("N", e_N, p_int32, true, NULL, 0, &function0);
-    s = "\tconstant "
-    s *= stmt.name*"(\""*stmt.name*"\", "
-    s *= tiramisu_translate(stmt.expr)
-    s *= ", "*jToT[stmt.typ]*", true, NULL, 0, "
-    s *= "&"*function_name*");\n"
-    s
-end
-
-function tiramisu_translate(stmt::TExpr)
-    s = ""
-    if typeof(stmt.val) <: TComputation
-        tb = stmt.val.access.ind
-        tb.name = stmt.name
-        s *= tiramisu_translate(tb)
-        stmt.val.access.buf = stmt.name
-        return s*tiramisu_translate_access(stmt.val)
-    end
-    if stmt.name != ""
-        s *= "\texpr "*stmt.name* " = "
-    end
-    if stmt.typ <: Union{SSAValue,SlotNumber,String}
-        s *= stmt.val
-    else
-        s*="expr("
-        if typeof(stmt.val) <: Union{TOp,TExpr}
-            s *=tiramisu_translate(stmt.val)
-        elseif !(stmt.typ <: Nullable)
-            s *= "("*jToC[stmt.typ]*")"*string(stmt.val)
-        elseif stmt.val != nothing
-            s *= stmt.val
-        end
-        s*=")"
-    end
-    if stmt.name != ""
-        s *= ";\n"
-    end
-    s
-end
-
-function tiramisu_translate(stmt::TOp)
-    if endswith(stmt.fcn,"()")
-        tiramisu_get_var(stmt.args[1])*"."*stmt.fcn
-    elseif endswith(stmt.fcn,"(")
-        s = stmt.fcn
-        for a in stmt.args
-            s *= tiramisu_translate(a) * ","
-        end
-        s = s[1:length(s) - 1]
-        s *= ")"
-    elseif length(stmt.args) == 1
-        stmt.fcn*tiramisu_translate(stmt.args[1])
-    elseif length(stmt.args) == 2
-        tiramisu_translate(stmt.args[1])*" "*stmt.fcn*" "*tiramisu_translate(stmt.args[2])
-    else
-        println("Unknown TOp translation")
-        dump(stmt)
-        ""
-    end
-end
-
-function tiramisu_translate(stmt::TBuffer)
-#buffer buf0("buf0", 2, {tiramisu::expr(10),tiramisu::expr(10)}, p_uint8, NULL, a_output, &function0);
-    s = "\tbuffer "
-    s *= stmt.name
-    s *= "(\""*stmt.name*"\", "
-    s *= string(length(stmt.dimensions)) *", {"
-    for d in stmt.dimensions
-        s *= tiramisu_translate(d)*", "
-    end
-    s = s[1:length(s)-2]
-    s *= "}, "*jToT[stmt.typ]*", NULL, "
-    if stmt.isoutput
-        s *= "a_output"
-    else
-        s *= "a_temporary"
-    end
-    s *= ", &"*function_name*");\n"
-    s
-end
-
-function tiramisu_translate(stmt::TComputation)
-    #computation S0("[N]->{S0[i,j]: 0<=i<N and 0<=j<N}", e3, true, p_uint8, &function0);
-    s = "\tcomputation " * stmt.name
-    s *= "(\"["
-    for r in stmt.space
-        s *= string(r)*","
-    end
-    s = s[1:length(s)-1]
-    s *= "]->{"*stmt.name*"["
-    for r in stmt.ranges
-        s *= r.iterator *","
-    end
-    s = s[1:length(s)-1]
-    s *= "]: "
-    for r in stmt.ranges
-        s*= string(r.low)*"<="*r.iterator*"<"*string(r.high)*" and "
-    end
-    s = s[1:length(s)-5]
-    s *= "}\", "
-    if stmt.setafter
-        s *= tiramisu_translate(TExpr("",nothing,Nullable))    
-    else
-        s *= tiramisu_translate(stmt.expr)
-    end
-    s *= ", true, "*jToT[stmt.typ]*", &"*function_name*");\n"
-    if stmt.setafter
-        s *= tiramisu_translate(stmt.expr)
-        s *= "\t"*stmt.name*".set_expression("*stmt.expr.name*");\n"
-        #c_C.set_expression(e1);
-    end
-    #S0.set_access("{S0[i,j]->buf0[i,j]}");
-    s *= tiramisu_translate_access(stmt)
-end
-
-function tiramisu_translate(stmt::TSignature)
-    global function_name
-    s = "\t$function_name.set_arguments({&"*string(stmt.ret)*"});\n" 
-    s *= "\t$function_name.gen_time_processor_domain();\n"
-    s *=  "\t$function_name.gen_isl_ast();\n"
-    s *= "\t$function_name.gen_halide_stmt();\n"
-    s *= "\t$function_name.gen_halide_obj(\"$OBJ\");\n"
-    s*"\treturn 0;\n"
-end
-
-function tiramisu_translate(stmt::TAccess)
-    ""
-end
-
-function tiramisu_translate(stmt::String)
-    stmt
-end
-
-function tiramisu_translate_access(stmt::TComputation)
-    #S0.set_access("{S0[i,j]->buf0[i,j]}");
-    s = "\t"*stmt.name*".set_access(\"{"
-    s *= stmt.name * "["
-    for r in stmt.ranges
-        s *= r.iterator *","
-    end
-    s = s[1:length(s)-1]
-    s *= "]->"*stmt.access.buf*"["
-    for r in stmt.access.ind
-        s *= r *","
-    end
-    s = s[1:length(s)-1]
-    s *= "]}\");\n"
-    if stmt.setafter#TODO: This is a hack
-        s *= "\tcomputation "*stmt.access.val*" = "*stmt.name*";\n"
-    end 
-    s
-end
-
-#End of tiramisu_translate methods
 
 #Returns the command to compile the written Tiramisu file
 function tiramisu_get_command()
@@ -712,11 +518,13 @@ function tiramisu_get_command()
     push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_utils.o")
     push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_halide_lowering.o")
     push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_from_halide.o")
-    push!(s,"$FILENAME","-o","$GEN","-I$TIRAMISU_INCLUDE_DIR") 
+    push!(s,"$FILENAME","-o","$GEN","-I$TIRAMISU_INCLUDE_DIR")
+    push!(s,"-I$ISL_INCLUDE_DIR")
     push!(s,"-I/usr/local/include","-I$HALIDE_INCLUDE_DIR")
     push!(s,"-I$HALIDE_TOOLS_DIR","-I$TIRAMISU_BUILD_DIR")
-    push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_INCLUDE_DIR/../lib","-lHalide","-ldl")
-    push!(s,"-lpthread","-lz","-ljpeg")#`libpng-config --cflags --ldflags`","-ljpeg")
+    push!(s,"-L$ISL_LIB_DIR")
+    push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_LIB_DIR","-lHalide","-ldl")
+    push!(s,"-lpthread","-lz","-ljpeg","-ltinfo")#`libpng-config --cflags --ldflags`","-ljpeg")
     Cmd(s)
 end
 
@@ -724,25 +532,40 @@ end
 function tiramisu_get_gen()
     env = copy(ENV)
     if haskey(env, "LD_LIBRARY_PATH") && env["LD_LIBRARY_PATH"] != ""
-        env["LD_LIBRARY_PATH"]*= ":$HALIDE_INCLUDE_DIR/../lib:/usr/local/lib:$TIRAMISU_BUILD_DIR"
+        env["LD_LIBRARY_PATH"]*= ":$HALIDE_INCLUDE_DIR/../lib:/usr/local/lib:$TIRAMISU_BUILD_DIR:$ISL_LIB_DIR"
     else
-        env["LD_LIBRARY_PATH"] = "$HALIDE_INCLUDE_DIR/../lib:/usr/local/lib:$TIRAMISU_BUILD_DIR"
+        env["LD_LIBRARY_PATH"] = "$HALIDE_INCLUDE_DIR/../lib:/usr/local/lib:$TIRAMISU_BUILD_DIR:$ISL_LIB_DIR"
     end
     if haskey(env, "DYLD_LIBRARY_PATH") && env["DYLD_LIBRARY_PATH"] != ""
-        env["DYLD_LIBRARY_PATH"]*= ":$HALIDE_INCLUDE_DIR/../lib:$TIRAMISU_BUILD_DIR"
+        env["DYLD_LIBRARY_PATH"]*= ":$HALIDE_INCLUDE_DIR/../lib:$TIRAMISU_BUILD_DIR:$ISL_LIB_DIR"
     else
-        env["DYLD_LIBRARY_PATH"] = "$HALIDE_INCLUDE_DIR/../lib:$TIRAMISU_BUILD_DIR"
+        env["DYLD_LIBRARY_PATH"] = "$HALIDE_INCLUDE_DIR/../lib:$TIRAMISU_BUILD_DIR:$ISL_LIB_DIR"
     end
     s = Cmd(["$GEN"])
     setenv(s,env)
 end
 
-#Returns the command to convert the generated function from an object file to a 
+#Returns the command to convert the generated function from an object file to a
 #dynamic shared library file. This is necessary because Julia could only use c++
-#code stored in libraries as opposed to object files 
+#code stored in libraries as opposed to object files
+function tiramisu_get_lib_obj()
+    s = ["g++","-c","-std=c++11","-O3","-Wall","-Wno-sign-compare","-fno-rtti","-fvisibility=hidden","-fPIC"]
+    push!(s,"-I$TIRAMISU_INCLUDE_DIR")
+    push!(s,"-I$ISL_INCLUDE_DIR")
+    push!(s,"-I/usr/local/include","-I$HALIDE_INCLUDE_DIR")
+    push!(s,"-I$HALIDE_TOOLS_DIR","-I$TIRAMISU_BUILD_DIR")
+    push!(s,"-L$ISL_LIB_DIR")
+    push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_LIB_DIR","-lHalide","-ldl")
+    push!(s,"-lpthread","-lz","-ljpeg","-ltinfo")#`libpng-config --cflags --ldflags`","-ljpeg")
+    push!(s,"-shared","-fPIC","-o","$OBJ_WRAPPER")
+    Cmd(s)
+end
+
+#Returns the command to convert the generated function from an object file to a
+#dynamic shared library file. This is necessary because Julia could only use c++
+#code stored in libraries as opposed to object files
 function tiramisu_get_lib()
     s = ["g++","-g","-std=c++11","-O3","-Wall","-Wno-sign-compare","-fno-rtti","-fvisibility=hidden","-fPIC"]
-    push!(s,"-shared","-fPIC","-o","$LIB","$OBJ")
     push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_core.o")
     push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_halide.o")
     push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_c.o")
@@ -750,11 +573,16 @@ function tiramisu_get_lib()
     push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_utils.o")
     push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_halide_lowering.o")
     push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_from_halide.o")
+    push!(s,OBJ)
+    push!(s,OBJ_WRAPPER)
     push!(s,"-I$TIRAMISU_INCLUDE_DIR")
+    push!(s,"-I$ISL_INCLUDE_DIR")
     push!(s,"-I/usr/local/include","-I$HALIDE_INCLUDE_DIR")
     push!(s,"-I$HALIDE_TOOLS_DIR","-I$TIRAMISU_BUILD_DIR")
-    push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_INCLUDE_DIR/../lib","-lHalide","-ldl")
-    push!(s,"-lpthread","-lz","-ljpeg", "-ldl")#`libpng-config --cflags --ldflags`","-ljpeg")
+    push!(s,"-L$ISL_LIB_DIR")
+    push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_LIB_DIR","-lHalide","-ldl")
+    push!(s,"-lpthread","-lz","-ljpeg","-ltinfo")#`libpng-config --cflags --ldflags`","-ljpeg")
+    push!(s,"-shared","-fPIC","-o","$LIB")
     Cmd(s)
 end
 
@@ -783,15 +611,6 @@ function tcanonicalize(tok)
     end
     s = replace(s, r"[^a-zA-Z0-9]", "_")
     s
-end
-
-#Converts a Julia ast that refers to a variable name into the proper variable name
-#This is the main reason we pass linfo around throughout body transfomation in
-#in main step 1.
-function tiramisu_get_var(ast,linfo)
-    s = string(lookupVariableName(ast,linfo))
-    s = tcanonicalize(s)
-    replace(s,Set("()"),"")
 end
 
 end

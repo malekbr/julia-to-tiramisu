@@ -2,24 +2,24 @@
 Copyright (c) 2015, Intel Corporation
 All rights reserved.
 
-Redistribution and use in source and binary forms, with or without 
+Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
-- Redistributions of source code must retain the above copyright notice, 
+- Redistributions of source code must retain the above copyright notice,
   this list of conditions and the following disclaimer.
-- Redistributions in binary form must reproduce the above copyright notice, 
-  this list of conditions and the following disclaimer in the documentation 
+- Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
   and/or other materials provided with the distribution.
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE 
-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF 
-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
 INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) 
-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF 
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 THE POSSIBILITY OF SUCH DAMAGE.
 =#
 
@@ -217,7 +217,7 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
   if ParallelAccelerator.getPseMode() == ParallelAccelerator.THREADS_MODE
     return code
   end
-  
+
   off_time_start = time_ns()
 
   package_root = ParallelAccelerator.getPackageRoot()
@@ -263,23 +263,23 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
       end
   end
   @dprintln(3, "array_types_in_sig including returns = ", array_types_in_sig)
- 
+
   outfile_name = CGen.writec(CGen.from_root_entry(code, function_name_string, signature, array_types_in_sig))
   CGen.compile(outfile_name)
   dyn_lib = CGen.link(outfile_name)
   full_outfile_name = "$package_root/deps/generated/$outfile_name.cpp"
   full_outfile_base = "$package_root/deps/generated/$outfile_name"
- 
+
   # The proxy function name is the original function name with "_j2c_proxy" appended.
   proxy_name = string("_",function_name_string,"_j2c_proxy")
   proxy_sym = gensym(proxy_name)
   @dprintln(2, "toCGen for ", proxy_name)
   @dprintln(2, "C File  = ", full_outfile_name)
   @dprintln(2, "dyn_lib = ", dyn_lib)
-  
+
   # This is the name of the function that j2c generates.
   j2c_name = string("_",function_name_string,"_")
-  
+
 
   # Convert Arrays in signature to Ptr and add extra arguments for array dimensions
   (modified_sig, sig_dims) = convert_sig(signature)
@@ -287,14 +287,14 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
   @dprintln(2, "sig_dims = ", sig_dims)
   original_args = CompilerTools.LambdaHandling.getInputParameters(LambdaVarInfo)
   @dprintln(3, "len? ", length(original_args), length(sig_dims))
- 
+
   map!(s -> gensym(string(s)), original_args)
   assert(length(original_args) == length(sig_dims))
   modified_args = Array(Any, length(sig_dims))
   extra_inits = Array(Any, 0)
   j2c_array = gensym("j2c_arr")
 
-  j2c_array_new = 
+  j2c_array_new =
     # Create a new j2c array object with element size in bytes and given dimension.
     # It will share the data pointer of the given inp array, and if inp is nothing,
     # the j2c array will allocate fresh memory to hold data.
@@ -312,7 +312,7 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
 
   for i = 1:length(sig_dims)
     arg = original_args[i]
-    if sig_dims[i] > 0 
+    if sig_dims[i] > 0
       j = length(extra_inits) + 1
       push!(extra_inits, :(to_j2c_array($arg, ptr_array_dict, $array_types_in_sig, $j2c_array_new)))
       modified_args[i] = :($(j2c_array)[$j])
@@ -320,7 +320,7 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
       modified_args[i] = arg
     end
   end
-  
+
   # Create a set of expressions to pass as arguments to specify the array dimension sizes.
   if ParallelAccelerator.getPseMode() == ParallelAccelerator.HOST_MODE
       run_where = -1
@@ -333,7 +333,7 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
   else
       throw("PSE mode error")
   end
-  
+
   num_rets = length(ret_typs)
   ret_arg_exps = Array(Any, 0)
   extra_sig = Array(Type, 0)
@@ -347,7 +347,7 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
           #push!(ret_arg_exps, Expr(:call, TopNode(:pointer), Expr(:call, TopNode(:arrayref), toRHSVar(:ret_args, Array{Any,1}, LambdaVarInfo), i)))
       end
   end
-  
+
   @dprintln(2,"signature = ", signature, " -> ", ret_typs)
   @dprintln(2,"modified_args = ", typeof(modified_args), " ", modified_args)
   @dprintln(2,"extra_sig = ", extra_sig)
@@ -400,7 +400,7 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
       # If the function returns nothing then just force it here since cgen code can't return it.
       return ($num_rets == 1 ? ($Void_return ? nothing : result[1]) : tuple(result...))
   end
-  
+
   off_time = time_ns() - off_time_start
   @dprintln(1, "accelerate: accelerate conversion time = ", ns_to_sec(off_time))
   return proxy_func
@@ -413,7 +413,7 @@ function toTiramisu(func :: GlobalRef, code, signature :: Tuple)
   if ParallelAccelerator.getPseMode() == ParallelAccelerator.THREADS_MODE
     return code
   end
-  
+
   off_time_start = time_ns()
 
   function_name_string = ParallelAccelerator.Tiramisu.tcanonicalize(string(func.name))
@@ -423,18 +423,27 @@ function toTiramisu(func :: GlobalRef, code, signature :: Tuple)
     linfo, body = lambdaToLambdaVarInfo(code)
   end
   dyn_lib = Tiramisu.tiramisu_from_root_entry(body,linfo,function_name_string)
-  proxy_name = function_name_string*"_tiramisu"
+  proxy_name = function_name_string#*"_tiramisu"
   proxy_sym = gensym(proxy_name)
+  println(proxy_name)
+  println(proxy_sym)
 
   original_args = CompilerTools.LambdaHandling.getInputParameters(linfo)
+  println(original_args)
   proxy_func = @eval function ($proxy_sym)()#$(original_args...))
-    ret = Array{Int64,2}()
-    #println("before ccall")
-    #dump(ret)
-    ccall(($function_name_string, $dyn_lib),Ptr{Int32},($linfo.return_type,),ret)
-    #println("after ccall")
-    #dump(ret)
-    ret
+    ret = Vector{Int64}(1)
+    println("before ccall")
+    dump(ret)
+    println($dyn_lib)
+    #lib = Libdl.dlopen("/home/malek/tiramisu/isl/build/lib/libisl.so")
+    lib = Libdl.dlopen($dyn_lib)
+    func_sym = Symbol($function_name_string * "_wrapper")
+    func = Libdl.dlsym(lib, func_sym)
+    println(func)
+    ccall(func, Void,(Ptr{Int64},), ret)
+    println("after ccall")
+    dump(ret)
+    ret[1]
   end
 
   off_time = time_ns() - off_time_start
@@ -467,7 +476,7 @@ end
 # Converts a given function and signature to use domain IR and parallel IR, and
 # remember it so that it won't be translated again.
 function accelerate(func::Function, signature::Tuple, level = TOPLEVEL)
-  pse_mode = ParallelAccelerator.getPseMode() 
+  pse_mode = ParallelAccelerator.getPseMode()
   if pse_mode == ParallelAccelerator.OFF_MODE
     return func
   end
@@ -487,7 +496,7 @@ function accelerate(func::Function, signature::Tuple, level = TOPLEVEL)
 
   local out
   ast = code_typed(func, signature)[1]
-  global alreadyOptimized 
+  global alreadyOptimized
   global seenByMacroPass
 
   # In threads mode we do not accelerator functions outside @acc
@@ -499,7 +508,7 @@ function accelerate(func::Function, signature::Tuple, level = TOPLEVEL)
     if !haskey(alreadyOptimized, (func, signature))
       push!(seenByMacroPass, func_ref)
       # place holder to prevent recursive accelerate
-      alreadyOptimized[(func, signature)] = ast 
+      alreadyOptimized[(func, signature)] = ast
       dir_ast = toDomainIR(func_ref, ast, signature)
       pir_ast = toParallelIR(func_ref, dir_ast, signature)
       pir_ast = toFlatParfors(func_ref, pir_ast, signature)
@@ -540,4 +549,3 @@ function accelerate(func::Function, signature::Tuple, level = TOPLEVEL)
 end
 
 end
- 
