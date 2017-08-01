@@ -422,28 +422,16 @@ function toTiramisu(func :: GlobalRef, code, signature :: Tuple)
   else
     linfo, body = lambdaToLambdaVarInfo(code)
   end
-  dyn_lib = Tiramisu.tiramisu_from_root_entry(body,linfo,function_name_string)
-  proxy_name = function_name_string#*"_tiramisu"
+  dyn_lib, (types, containers, decouple) = Tiramisu.tiramisu_from_root_entry(body,linfo,function_name_string)
+  proxy_name = function_name_string
   proxy_sym = gensym(proxy_name)
-  println(proxy_name)
-  println(proxy_sym)
 
-  original_args = CompilerTools.LambdaHandling.getInputParameters(linfo)
-  println(original_args)
-  proxy_func = @eval function ($proxy_sym)()#$(original_args...))
-    ret = Vector{Int64}(1)
-    println("before ccall")
-    dump(ret)
-    println($dyn_lib)
-    #lib = Libdl.dlopen("/home/malek/tiramisu/isl/build/lib/libisl.so")
+  proxy_func = @eval function ($proxy_sym)()
     lib = Libdl.dlopen($dyn_lib)
     func_sym = Symbol($function_name_string * "_wrapper")
     func = Libdl.dlsym(lib, func_sym)
-    println(func)
-    ccall(func, Void,(Ptr{Int64},), ret)
-    println("after ccall")
-    dump(ret)
-    ret[1]
+    ccall(func, Void, $types, $containers...)
+    return $decouple($containers)
   end
 
   off_time = time_ns() - off_time_start

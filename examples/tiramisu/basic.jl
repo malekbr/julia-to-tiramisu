@@ -6,9 +6,9 @@ using ParallelAccelerator
   # A = fill(1, w, h)
   # B = fill(1, w, h)
   # C = A + B
-  #a = Matrix{Int64}(2, 4)
-  #return a
-  return 1
+  a = 1 + 2
+  b = 3 + 4 +5
+  return 1 + 2 + a + b
 end
 
 function main()

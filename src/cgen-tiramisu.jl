@@ -62,6 +62,9 @@ jToT = Dict(
 Primitive = Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64,
                   Float16, Float32, Float64, Bool}
 
+Variable = Union{SlotNumber, SSAValue}
+
+# TODO : multiple computations per variable for SlotNumber
 
 #TODO: Edit these constants to match the proper directory of all the following
 const HALIDE_INCLUDE_DIR = "/home/malek/tiramisu/Halide/include"
@@ -122,6 +125,7 @@ type TBuffer
     dimensions :: Array{TExpr,1}
     typ
     argument::TBufferArgument
+    is_scalar::Bool
 end
 
 
@@ -191,14 +195,18 @@ type TRead <: TExpr
     indices::Vector{TIndex}
 end
 
-vars = Dict{SSAValue, JVar}()
+vars = Dict{Variable, JVar}()
+
+idToBufferName(id::SSAValue) = "BSSA" * string(id.id)
+idToBufferName(id::SlotNumber) = "BSN" * string(id.id)
 
 typToTBuffer = Dict(
     Int64 => function(id, typ)
-        return TBuffer("B"*string(id.id),
+        return TBuffer(idToBufferName(id),
                        [TValue("", 1, Int64)],
                        Int64,
-                       TBTemporary)
+                       TBTemporary,
+                       true)
     end,
 )
 
@@ -232,7 +240,7 @@ function getRHS(node::Primitive)
     return TValue("", node, typeof(node))
 end
 
-function getRHS(node::SSAValue)
+function getRHS(node::Variable)
     if !haskey(vars, node)
         throw(UndefVarError(Symbol(node)))
     end
@@ -262,8 +270,8 @@ callHandlers = Dict(
     end
 )
 
-function handleReturn(arg::SSAValue, typ::DataType)
-    vars[expr.args[1]].buffer.argument = TBOutput
+function handleReturn(arg::Variable, typ::DataType)
+    vars[arg].buffer.argument = TBOutput
 end
 
 function handleReturn(arg, typ::DataType)
@@ -346,12 +354,51 @@ function tiramisu_from_root_entry(body, linfo, functionName::AbstractString)
     run(tiramisu_get_lib_obj())
     run(tiramisu_get_lib())
     #println("Converted to .so file")
-    LIB #, get_return()
+    LIB, get_return()
 end
 
-# function get_return()
-#     return Vector{}
-# end
+
+
+# Converts a buffer to the corresponding type to pass to the C function
+# Example : Buffer(Int32, {2, 3, 4}) becomes Ptr{Ptr{Ptr{Int32}}}
+# But generate Symbol equivalent, i.e. :(Ptr{Ptr{Ptr{Int32}}})
+function buffer_to_ccall_type(buffer)
+    # need to construct it in this obscure way to be equivalent to
+    # the symbol equivalent of writing
+    t = :($(buffer.typ))
+    for d in buffer.dimensions
+        t = :(Ptr{$(t)})
+    end
+    return t
+end
+
+function buffer_to_ccall_container(buffer)
+    return Array(buffer.typ, [dim.val for dim in buffer.dimensions]...)
+end
+
+# TODO: handle Tuple return
+function decouple_scalar(containers)
+    return containers[1][1]
+end
+
+# TODO: handle Tuple return
+function decouple_buffer(containers)
+    return containers[1]
+end
+
+# returns a tuple of:
+# - A tuple of types; (Ptr{Int32},)...
+# - The corresponding containers in a list
+function get_return()
+    # TODO : handle input
+    interface = [var.buffer for (id, var) in vars if var.buffer.argument == TBOutput]
+    # TODO: handle Tuple return
+    assert(length(interface) == 1)
+    decouple = interface[1].is_scalar ? decouple_scalar : decouple_buffer
+    return (Expr(:tuple, map(buffer_to_ccall_type, interface)...),
+            map(buffer_to_ccall_container, interface),
+            decouple)
+end
 
 #Imports for Tiramisu file
 function tiramisu_from_header(linfo)
@@ -426,15 +473,18 @@ function tiramisu_analyze_body(ast::Expr, linfo)
         dump(expr)
         parseExpr(expr)
     end
+    # throw(InterruptException())
     # computation pass
     lines = Vector{String}()
-    for (id, var) in vars
+
+    computations = sort([var.computation for (id, var) in vars], by=(c -> c.name))
+    for computation in computations
         push!(lines,
-              "tiramisu::computation $(var.computation.name)(" *
-              "\"" * createISL(var.computation) * "\", " *
-              createTExpr(var.computation.expr) * ", " *
-              string(!var.computation.is_input) * ", " *
-              jToT[var.computation.typ] * ", " *
+              "tiramisu::computation $(computation.name)(" *
+              "\"" * createISL(computation) * "\", " *
+              createTExpr(computation.expr) * ", " *
+              string(!computation.is_input) * ", " *
+              jToT[computation.typ] * ", " *
               "&$function_name);")
     end
     for (id, var) in vars
@@ -445,7 +495,7 @@ function tiramisu_analyze_body(ast::Expr, linfo)
               "{" * join(map(createTExpr, var.buffer.dimensions), ", ") * "}, " *
               jToT[var.buffer.typ] * ", " *
               "NULL, " *
-              argNames[var.buffer.argument] * ", ",
+              argNames[var.buffer.argument] * ", " *
               "&$function_name);")
         push!(lines,
               "$(var.computation.name).set_access(\"{$(var.computation.name)[" *
@@ -453,6 +503,13 @@ function tiramisu_analyze_body(ast::Expr, linfo)
                 "$(var.buffer.name)[" *
                 getIndices(var.computation) * "]}\");")
     end
+    # Scheduling
+    for i=1:(length(computations) - 1)
+        push!(lines,
+              "$(computations[i+1].name).after($(computations[i].name), " *
+              "computation::root_dimension);")
+    end
+
     interface = [var.buffer.name for (id, var) in vars if var.buffer.argument != TBTemporary]
     push!(lines, "$function_name.set_arguments({" *
                   join(map(s -> "&" * s, interface), ", ")
