@@ -25,6 +25,8 @@ using CompilerTools.Helper
 DebugMsg.init()
 
 using ..ParallelAccelerator
+include("tiramisu_prepass.jl")
+
 export tiramisu_from_root_entry, tcanonicalize
 
 jToC = Dict(
@@ -469,11 +471,12 @@ function createISL(comp::TComputation)
 end
 
 function tiramisu_analyze_body(ast::Expr, linfo)
+    TiramisuPrepass.detector(ast)
     for expr in ast.args
-        dump(expr)
-        parseExpr(expr)
+        # dump(expr)
+        # parseExpr(expr)
     end
-    # throw(InterruptException())
+    throw(InterruptException())
     # computation pass
     lines = Vector{String}()
 
