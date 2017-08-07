@@ -2,24 +2,24 @@
 Copyright (c) 2015, Intel Corporation
 All rights reserved.
 
-Redistribution and use in source and binary forms, with or without 
+Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
-- Redistributions of source code must retain the above copyright notice, 
+- Redistributions of source code must retain the above copyright notice,
   this list of conditions and the following disclaimer.
-- Redistributions in binary form must reproduce the above copyright notice, 
-  this list of conditions and the following disclaimer in the documentation 
+- Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
   and/or other materials provided with the distribution.
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE 
-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF 
-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
 INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) 
-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF 
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 THE POSSIBILITY OF SUCH DAMAGE.
 =#
 
@@ -34,7 +34,7 @@ importall CompilerTools
 using CompilerTools.OptFramework
 
 #######################################################################
-# Constants and functions below this line are not exported, and should 
+# Constants and functions below this line are not exported, and should
 # be used either fully qualified, or explicitly imported.
 #######################################################################
 
@@ -53,7 +53,7 @@ num_acc_allocs = 0
 num_acc_parfors = 0
 
 """
-(internal) Sets the number of allocations left in the accelerated function after optimizations. 
+(internal) Sets the number of allocations left in the accelerated function after optimizations.
 """
 function set_num_acc_allocs(allocs::Int)
     global num_acc_allocs = allocs
@@ -70,7 +70,7 @@ end
 
 
 """
-Returns the number of allocations left in the accelerated function after optimizations. 
+Returns the number of allocations left in the accelerated function after optimizations.
 """
 function get_num_acc_allocs()
     return num_acc_allocs
@@ -93,9 +93,9 @@ function getPseMode()
      mode = "host"
   end
   if mode == "none" || mode == "off"
-    OFF_MODE 
+    OFF_MODE
   elseif mode == "host"
-    HOST_MODE 
+    HOST_MODE
   elseif mode == "offload1"
     OFFLOAD1_MODE
   elseif mode == "offload2"
@@ -121,7 +121,7 @@ function getTiramisuMode()
   if mode == "cgen"
     USE_CGEN
   elseif mode == "tiramisu"
-    USE_TIRAMISU 
+    USE_TIRAMISU
   elseif mode == "both"
     USE_BOTH
   else
@@ -137,7 +137,7 @@ const DYNAMIC_TASK_MODE = 3
 
 """
 Return internal mode number by looking up environment variable "PROSPECT_TASK_MODE".
-If not specified, it defaults to NO_TASK_MODE, or DYNAMIC_TASK_MODE when 
+If not specified, it defaults to NO_TASK_MODE, or DYNAMIC_TASK_MODE when
 getPseMode() is TASK_MODE.
 """
 function getTaskMode()
@@ -317,14 +317,14 @@ function __init__()
     if getPseMode() == OFF_MODE
       addOptPass(runStencilMacro, PASS_MACRO)
       #addOptPass(cleanupAPI, PASS_MACRO)
-    else 
+    else
       addOptPass(captureOperators, PASS_MACRO)
       addOptPass(toCartesianArray, PASS_MACRO)
       addOptPass(expandParMacro, PASS_MACRO)
       addOptPass(extractCallGraph, PASS_TYPED)
       addOptPass(toDomainIR, PASS_TYPED)
-      addOptPass(toParallelIR, PASS_TYPED)
-      addOptPass(toFlatParfors, PASS_TYPED)
+      # addOptPass(toParallelIR, PASS_TYPED)
+      # addOptPass(toFlatParfors, PASS_TYPED)
       if (getTiramisuMode() == USE_TIRAMISU)
         addOptPass(toTiramisu, PASS_TYPED)
       #elseif (getTiramisuMode() == USE_BOTH)

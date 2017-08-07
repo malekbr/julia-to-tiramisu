@@ -12,7 +12,8 @@ end
 
 function main()
     tic()
-    D = mult()
+    mult()
+    #D = mult()
     println("SELFTIMED ", toq())
 
     #println(D)

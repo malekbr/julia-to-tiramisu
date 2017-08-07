@@ -471,9 +471,11 @@ function createISL(comp::TComputation)
 end
 
 function tiramisu_analyze_body(ast::Expr, linfo)
+    # dump(ast.args)
+    # throw(InterruptException())
     TiramisuPrepass.detector(ast)
     for expr in ast.args
-        # dump(expr)
+        dump(expr)
         # parseExpr(expr)
     end
     throw(InterruptException())
