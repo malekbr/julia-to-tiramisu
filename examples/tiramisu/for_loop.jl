@@ -11,7 +11,6 @@ using ParallelAccelerator
   #   end
   # end
   # return t
-  a = (b = 5)
   t = 0
   for i=1:5
     for j=7:9

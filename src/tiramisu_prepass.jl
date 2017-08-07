@@ -78,301 +78,255 @@ function onlyGotoNodeB(f::Function)
     return f(node, index, state)
   end
 end
-# FOR LOOP HEADER DETECTION
-
-type ForLoopHeaderSLE <: State
-  lower::Integer
-  upper::Integer
-  top_index::Integer
-  result::SSAValue
-end
-
-function isForLoopHeaderSLE(expr::Expr, index::Integer, state::NoState)
-  is_valid = (expr.head == :(=) &&
-              typeof(expr.args[2]) <: Expr &&
-              expr.args[2].head == :call &&
-              expr.args[2].args[1] == GlobalRef(Core.Intrinsics, :sle_int))
-  if is_valid
-    return true, ForLoopHeaderSLE(expr.args[2].args[2],
-                                  expr.args[2].args[3],
-                                  index,
-                                  expr.args[1])
-  end
-  return false, NoState()
-end
-
-type ForLoopHeaderSubInt <: State
-  lower::Integer
-  upper::Integer
-  top_index::Integer
-  sle_result::SSAValue
-  sub_int_result::SSAValue
-end
-
-function isForLoopHeaderSubInt(expr::Expr, index::Integer, state::ForLoopHeaderSLE)
-  is_valid = (expr.head == :(=) &&
-              typeof(expr.args[2]) <: Expr &&
-              expr.args[2].head == :call &&
-              expr.args[2].args[1] == GlobalRef(Core.Intrinsics, :box) &&
-              typeof(expr.args[2].args[3]) <: Expr &&
-              expr.args[2].args[3].head == :call &&
-              expr.args[2].args[3].args[1] == GlobalRef(Core.Intrinsics, :sub_int) &&
-              expr.args[2].args[3].args[2] == state.lower &&
-              expr.args[2].args[3].args[3] == 1)
-
-  if is_valid
-    return true, ForLoopHeaderSubInt(state.lower,
-                                     state.upper,
-                                     state.top_index,
-                                     state.result,
-                                     expr.args[1])
-  end
-  return false, NoState()
-end
-
-type ForLoopHeaderSelect <: State
-  lower::Integer
-  upper::Integer
-  top_index::Integer
-  result::SSAValue
-end
-
-function isForLoopHeaderSelect(expr::Expr, index::Integer, state::ForLoopHeaderSubInt)
-  is_valid = (expr.head == :(=) &&
-              typeof(expr.args[2]) <: Expr &&
-              expr.args[2].head == :call &&
-              expr.args[2].args[1] == GlobalRef(Core.Intrinsics, :select_value) &&
-              expr.args[2].args[2] == state.sle_result &&
-              expr.args[2].args[3] == state.upper &&
-              expr.args[2].args[4] == state.sub_int_result)
-
-  if is_valid
-    return true, ForLoopHeaderSelect(state.lower,
-                                     state.upper,
-                                     state.top_index,
-                                     expr.args[1])
-  end
-  return false, NoState()
-end
-
-type ForLoopHeaderAddInt <: State
-  lower::Integer
-  upper::Integer
-  top_index::Integer
-  result::SSAValue
-end
-
-function isForLoopHeaderAddInt(expr::Expr, index::Integer, state::ForLoopHeaderSelect)
-  is_valid = (expr.head == :(=) &&
-              typeof(expr.args[2]) <: Expr &&
-              expr.args[2].head == :call &&
-              expr.args[2].args[1] == GlobalRef(Core.Intrinsics, :box) &&
-              typeof(expr.args[2].args[3]) <: Expr &&
-              expr.args[2].args[3].head == :call &&
-              expr.args[2].args[3].args[1] == GlobalRef(Core.Intrinsics, :add_int) &&
-              expr.args[2].args[3].args[2] == state.result &&
-              expr.args[2].args[3].args[3] == 1)
-
-  if is_valid
-    return true, ForLoopHeaderAddInt(state.lower,
-                                     state.upper,
-                                     state.top_index,
-                                     expr.args[1])
-  end
-  return false, NoState()
-end
 
 type ForLoopData <: State
-  lower::Integer # lower bound of loop
-  upper::Integer # upper bound of loop
-  protec_upper::SSAValue # Computed upper bound of loop
+  from::Integer # lower bound of loop
+  to::Integer # upper bound of loop
+  protec_to::SSAValue # Computed upper bound of loop
   loop_var::Union{Void, SlotNumber} # Actual loop variable
   used_loop_var::Union{Void, SlotNumber} # Exposed loop variable (if variable is used)
-  begin_loop_label::Union{Void, Int64} # Label for reloop
-  cont_loop_label::Union{Void, Int64} # Uncertain? There is some label before last Goto
-  end_loop_label::Union{Void, Int64} # Label to end loop
-  comp_res::Union{Void, SSAValue} # result of loop_var === protec_upper
-  cond_res::Union{Void, SSAValue} # result of not(comp_res)
-  loop_var_temp::Union{Void, SSAValue} # In case of used_loop_var, original value stored here
-  top_index::Integer # Index of loop header
-  start_begin_index::Integer # Starting index of loop start
-  start_end_index::Integer # Ending index of loop start
+  begin_label::Union{Void, Int64} # Label for reloop
+  end_label::Union{Void, Int64} # Label to end loop
+  temp_loop_var::Union{Void, SSAValue} # In case of used_loop_var, original value stored here
+  inc_loop_var::Union{Void, SSAValue} # In case of used_loop_var, original value stored here
+  header_index::Integer # Index of loop header
+  top_index::Integer
   bottom_index::Integer # Index of Goto at loop end
 end
 
+isForLoopHeader = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
+  is_valid = (expr.head === :(=))
+
+  if !is_valid
+    return false, NoState()
+  end
+
+  sel_expr = expr.args[2]
+
+  is_valid = (isa(sel_expr, Expr) &&
+              sel_expr.head === :call &&
+              sel_expr.args[1] === GlobalRef(Base, :select_value))
+
+  if !is_valid
+    return false, NoState()
+  end
+
+  comp_expr = sel_expr.args[2]
+
+  is_valid &= (isa(comp_expr, Expr) &&
+               comp_expr.head === :call &&
+               comp_expr.args[1] === GlobalRef(Base, :sle_int))
+
+  if !is_valid
+    return false, NoState()
+  end
+
+  from = comp_expr.args[2]
+  to = comp_expr.args[3]
+
+  is_valid &= sel_expr.args[3] === to
+
+  if !is_valid
+    return false, NoState()
+  end
+
+  box_expr = sel_expr.args[4]
+
+  is_valid &= (isa(box_expr, Expr) &&
+               box_expr.head === :call &&
+               box_expr.args[1] === GlobalRef(Base, :box) &&
+               box_expr.args[2] === Int64)
+
+  if !is_valid
+    return false, NoState()
+  end
+
+  sub_expr = box_expr.args[3]
+
+  is_valid &= (isa(sub_expr, Expr) &&
+               sub_expr.head === :call &&
+               sub_expr.args[1] === GlobalRef(Base, :sub_int) &&
+               sub_expr.args[2] === from &&
+               sub_expr.args[3] === 1)
+
+  if is_valid
+    state = ForLoopData(from, to, expr.args[1], nothing, nothing, nothing,
+                        nothing, nothing, nothing, index, 0, 0)
+    return true, state
+  end
+  return false, NoState()
+end)
+
+isForLoopVarInit = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
+  is_valid = (expr.head === :(=) &&
+              isa(expr.args[1], SlotNumber) &&
+              expr.args[2] === state.from)
+  state.loop_var = expr.args[1]
+  return is_valid, state
+end)
+
+isForLoopBeginLabel = onlyLabelNode(function(label::LabelNode, index::Integer, state::ForLoopData)
+  state.begin_label = label.label
+  return true, state
+end)
+
+isForLoopTestGoto = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
+  is_valid = expr.head === :gotoifnot
+
+  if !is_valid
+    return false, state
+  end
+
+  box_expr = expr.args[1]
+
+  is_valid &= (isa(box_expr, Expr) &&
+               box_expr.head === :call &&
+               box_expr.args[1] === GlobalRef(Base, :box) &&
+               box_expr.args[2] === GlobalRef(Base, :Bool))
+
+  if !is_valid
+    return false, state
+  end
+
+  not_expr = box_expr.args[3]
+
+  is_valid &= (isa(not_expr, Expr) &&
+               not_expr.head === :call &&
+               not_expr.args[1] === GlobalRef(Base, :not_int))
+
+  if !is_valid
+    return false, state
+  end
+
+  comp_expr = not_expr.args[2]
+
+  is_valid &= (isa(comp_expr, Expr) &&
+               comp_expr.args[1] === GlobalRef(Base, :(===)) &&
+               comp_expr.args[2] === state.loop_var)
+
+  if !is_valid
+    return false, state
+  end
+
+  box_expr = comp_expr.args[3]
+
+  is_valid &= (isa(box_expr, Expr) &&
+               box_expr.head === :call &&
+               box_expr.args[1] === GlobalRef(Base, :box) &&
+               box_expr.args[2] === Int64)
+
+  if !is_valid
+    return false, state
+  end
+
+  add_expr = box_expr.args[3]
+
+  is_valid &= (isa(add_expr, Expr) &&
+               add_expr.head === :call &&
+               add_expr.args[1] === GlobalRef(Base, :add_int) &&
+               add_expr.args[2] === state.protec_to &&
+               add_expr.args[3] === 1)
+
+  if is_valid
+    state.end_label = expr.args[2]
+  end
+
+  return is_valid, state
+end)
+
+isForLoopVarSave = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
+  is_valid = (expr.head === :(=) &&
+              isa(expr.args[1], SSAValue) &&
+              expr.args[2] === state.loop_var)
+  if is_valid
+    state.temp_loop_var = expr.args[1]
+  end
+  return is_valid, state
+end)
+
+isForLoopVarInc = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
+  is_valid = (expr.head === :(=) &&
+              isa(expr.args[1], SSAValue))
+
+  if !is_valid
+    return false, state
+  end
+
+  box_expr = expr.args[2]
+
+  is_valid &= (isa(box_expr, Expr) &&
+               box_expr.head === :call &&
+               box_expr.args[1] === GlobalRef(Base, :box) &&
+               box_expr.args[2] === Int64)
+
+  if !is_valid
+    return false, state
+  end
+
+  add_expr = box_expr.args[3]
+
+  is_valid &= (isa(add_expr, Expr) &&
+               add_expr.head === :call &&
+               add_expr.args[1] === GlobalRef(Base, :add_int) &&
+               add_expr.args[2] === state.loop_var &&
+               add_expr.args[3] === 1)
+
+  if is_valid
+    state.inc_loop_var = expr.args[1]
+  end
+
+  return is_valid, state
+end)
+
+isForLoopUsedVar = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
+  is_valid = (expr.head === :(=) &&
+              isa(expr.args[1], SlotNumber) &&
+              expr.args[2] === state.temp_loop_var)
+  if is_valid
+    state.used_loop_var = expr.args[1]
+  end
+
+  return is_valid, state
+end)
+
+isForLoopUpdateVar = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
+  is_valid = (expr.head === :(=) &&
+              expr.args[1] === state.loop_var &&
+              expr.args[2] === state.inc_loop_var)
+
+  if is_valid
+    state.top_index = index
+  end
+
+  return is_valid, state
+end)
+
 for_loop_changer = Changer(Set(1:0), Dict{Integer, Function}())
 
-function forLoopHeaderValidator(state::ForLoopHeaderAddInt, ast::Expr)
-  println("Detected for loop from $(state.lower) to $(state.upper) at $(state.result)")
-  finalState = ForLoopData(state.lower, state.upper, state.result,
-                            nothing, nothing, nothing, nothing, nothing,
-                            nothing, nothing, nothing, state.top_index,
-                            0, 0, 0)
-  top_found = false
+function forLoopHeaderValidator(state::ForLoopData, ast::Expr)
+
   for (i, expr) in enumerate(ast.args)
     # order is important
-    if top_found
-      if (isForLoopEndGoto(expr, i,  finalState) &&
-          isForLoopEndLabel(ast.args[i + 1], i + 1, finalState))
-        for_loop_changer.ignore = Set(union(for_loop_changer.ignore,
-                   finalState.top_index:(finalState.top_index + 3)))
-        println(for_loop_changer.ignore)
-        for_loop_changer.ignore = Set(union(for_loop_changer.ignore,
-                   (finalState.start_begin_index + 1):finalState.start_end_index))
-        println(for_loop_changer.ignore)
-        for_loop_changer.ignore = Set(union(for_loop_changer.ignore,
-                   (finalState.bottom_index + 1):(finalState.bottom_index + 1)))
-        println(for_loop_changer.ignore)
-        for_loop_changer.changers[finalState.start_begin_index] = function()
-          return Expr(:for_loop_start, finalState.protec_upper,
-                      finalState.lower, finalState.upper, 1,
-                      finalState.loop_var, finalState.used_loop_var)
-        end
-        for_loop_changer.changers[finalState.bottom_index] = function()
-          return Expr(:for_loop_end, finalState.protec_upper)
-        end
-        println("Done")
-        break
+    if (isForLoopEndGoto(expr, i,  state) &&
+        isForLoopEndLabel(ast.args[i + 1], i + 1, state))
+      union!(for_loop_changer.ignore,
+             Set((state.header_index + 1):state.top_index))
+      push!(for_loop_changer.ignore, state.bottom_index + 1)
+      for_loop_changer.changers[state.header_index] = function()
+        return Expr(:for_loop_start, state.protec_to,
+                    state.from, state.to, 1,
+                    state.loop_var, state.used_loop_var)
       end
-    else
-      if (isForLoopTestComp(expr, i, finalState) &&
-          isForLoopTestInit(ast.args[i - 2], i - 2, finalState) &&
-          isForLoopTestLabel(ast.args[i - 1], i - 1, finalState) &&
-          isForLoopTestCond(ast.args[i + 1], i + 1, finalState) &&
-          isForLoopTestGoto(ast.args[i + 2], i + 2, finalState) &&
-          ((isForLoopIncUsedAdd(ast.args[i + 3], i + 3, finalState) &&
-            isForLoopIncUsedVar(ast.args[i + 4], i + 4, finalState) &&
-            isForLoopIncUsedUpdate(ast.args[i + 5], i + 5, finalState)) ||
-           isForLoopIncUnusedAdd(ast.args[i + 3], i + 3, finalState)))
-        top_found = true
+      for_loop_changer.changers[state.bottom_index] = function()
+        return Expr(:for_loop_end, state.protec_to)
       end
+      break
     end
   end
 end
 
-
-# FOR LOOP TEST DETECTION
-
-# Order: Comp -> Init -> Label -> Cond -> Goto
-
-isForLoopTestInit = onlyExprB(function(expr::Expr, index::Integer, state::ForLoopData)
-  is_valid = (expr.head == :(=) &&
-              expr.args[1] == state.loop_var  &&
-              expr.args[2] == state.lower)
-  if is_valid
-    state.start_begin_index = index
-  end
-  return is_valid
-end)
-
-isForLoopTestLabel = onlyLabelNodeB(function(label::LabelNode, index::Integer, state::ForLoopData)
-  state.begin_loop_label = label.label
-  return true
-end)
-
-isForLoopTestComp = onlyExprB(function(expr::Expr, index::Integer, state::ForLoopData)
-  is_valid = (expr.head == :(=) &&
-              typeof(expr.args[1]) <: SSAValue &&
-              typeof(expr.args[2]) <: Expr &&
-              expr.args[2].head == :call &&
-              expr.args[2].args[1] == GlobalRef(Core, :(===)) &&
-              typeof(expr.args[2].args[2]) <: SlotNumber &&
-              expr.args[2].args[3] == state.protec_upper)
-
-  if is_valid
-    state.comp_res = expr.args[1]
-    state.loop_var = expr.args[2].args[2]
-  end
-
-  return is_valid
-end)
-
-isForLoopTestCond = onlyExprB(function(expr::Expr, index::Integer, state::ForLoopData)
-  is_valid = (expr.head == :(=) &&
-              typeof(expr.args[1]) <: SSAValue &&
-              typeof(expr.args[2]) <: Expr &&
-              expr.args[2].head == :call &&
-              expr.args[2].args[1] == GlobalRef(Core.Intrinsics, :box) &&
-              typeof(expr.args[2].args[3]) <: Expr &&
-              expr.args[2].args[3].head == :call &&
-              expr.args[2].args[3].args[1] == GlobalRef(Core.Intrinsics, :not_int) &&
-              expr.args[2].args[3].args[2] == state.comp_res)
-
-  if is_valid
-    state.cond_res = expr.args[1]
-  end
-  return is_valid
-end)
-
-isForLoopTestGoto = onlyExprB(function(expr::Expr, index::Integer, state::ForLoopData)
-  is_valid = (expr.head == :gotoifnot &&
-              expr.args[1] == state.cond_res &&
-              typeof(expr.args[2]) <: Integer) # TODO always???????
-
-  if is_valid
-    state.end_loop_label = expr.args[2]
-  end
-  return is_valid
-end)
-
-isForLoopIncUsedAdd = onlyExprB(function(expr::Expr, index::Integer, state::ForLoopData)
-  is_valid = (expr.head == :(=) &&
-              typeof(expr.args[1]) <: SSAValue &&
-              typeof(expr.args[2]) <: Expr &&
-              expr.args[2].head == :call &&
-              expr.args[2].args[1] == GlobalRef(Core.Intrinsics, :box) &&
-              typeof(expr.args[2].args[3]) <: Expr &&
-              expr.args[2].args[3].head == :call &&
-              expr.args[2].args[3].args[1] == GlobalRef(Core.Intrinsics, :add_int) &&
-              expr.args[2].args[3].args[2] == state.loop_var &&
-              expr.args[2].args[3].args[3] == 1)
-
-  if is_valid
-    state.loop_var_temp = expr.args[1]
-  end
-  return is_valid
-end)
-
-isForLoopIncUsedVar = onlyExprB(function(expr::Expr, index::Integer, state::ForLoopData)
-  is_valid = (expr.head == :(=) &&
-              typeof(expr.args[1]) <: SlotNumber &&
-              expr.args[2] == state.loop_var)
-
-  if is_valid
-    state.used_loop_var = expr.args[1]
-  end
-  return is_valid
-end)
-
-
-isForLoopIncUsedUpdate = onlyExprB(function(expr::Expr, index::Integer, state::ForLoopData)
-  is_valid = (expr.head == :(=) &&
-              expr.args[1] == state.loop_var &&
-              expr.args[2] == state.loop_var_temp)
-  if is_valid
-    state.start_end_index = index
-  end
-  return is_valid
-end)
-isForLoopIncUnusedAdd = onlyExprB(function(expr::Expr, index::Integer, state::ForLoopData)
-  is_valid = (expr.head == :(=) &&
-              expr.args[1] == state.loop_var &&
-              typeof(expr.args[2]) <: Expr &&
-              expr.args[2].head == :call &&
-              expr.args[2].args[1] == GlobalRef(Core.Intrinsics, :box) &&
-              typeof(expr.args[2].args[3]) <: Expr &&
-              expr.args[2].args[3].head == :call &&
-              expr.args[2].args[3].args[1] == GlobalRef(Core.Intrinsics, :add_int) &&
-              expr.args[2].args[3].args[2] == state.loop_var &&
-              expr.args[2].args[3].args[3] == 1)
-  if is_valid
-    state.start_end_index = index
-  end
-  return is_valid
-end)
-
 isForLoopEndGoto = onlyGotoNodeB(function(expr::GotoNode, index::Integer, state::ForLoopData)
-  is_valid = expr.label == state.begin_loop_label
+  is_valid = expr.label == state.begin_label
   if is_valid
     state.bottom_index = index
   end
@@ -380,23 +334,38 @@ isForLoopEndGoto = onlyGotoNodeB(function(expr::GotoNode, index::Integer, state:
 end)
 
 isForLoopEndLabel = onlyLabelNodeB(function(expr::LabelNode, index::Integer, state::ForLoopData)
-  state.end_loop_label = expr.label
-  return true
+  return state.end_label == expr.label
 end)
 #### Basic detector
 
-for_loop_header_pattern = Pattern([onlyExpr(isForLoopHeaderSLE),
-                                   onlyExpr(isForLoopHeaderSubInt),
-                                   onlyExpr(isForLoopHeaderSelect),
-                                   onlyExpr(isForLoopHeaderAddInt)],
-                                  forLoopHeaderValidator)
+# for_loop_header_pattern = Pattern([onlyExpr(isForLoopHeaderSLE),
+#                                    onlyExpr(isForLoopHeaderSubInt),
+#                                    onlyExpr(isForLoopHeaderSelect),
+#                                    onlyExpr(isForLoopHeaderAddInt)],
+#                                   forLoopHeaderValidator)
 
-for_loop_patterns = [for_loop_header_pattern] #, for_loop_test_pattern]
+for_loop_used_pattern = Pattern([isForLoopHeader,
+                                   isForLoopVarInit,
+                                   isForLoopBeginLabel,
+                                   isForLoopTestGoto,
+                                   isForLoopVarSave,
+                                   isForLoopVarInc,
+                                   isForLoopUsedVar,
+                                   isForLoopUpdateVar], forLoopHeaderValidator)
+
+for_loop_unused_pattern = Pattern([isForLoopHeader,
+                                   isForLoopVarInit,
+                                   isForLoopBeginLabel,
+                                   isForLoopTestGoto,
+                                   isForLoopVarInc,
+                                   isForLoopUpdateVar], forLoopHeaderValidator)
+
+for_loop_patterns = [for_loop_used_pattern, for_loop_unused_pattern] #, for_loop_test_pattern]
 
 function detector(ast::Expr)
-  remove_unused(ast)
+  remove_unused!(ast)
   detector(ast, for_loop_patterns)
-  # dump(change(ast, [for_loop_changer]))
+  ast.args = change(ast, [for_loop_changer])
 end
 
 first_else(iter, e) = isempty(iter) ? e : first(iter)
@@ -461,7 +430,7 @@ function get_used_def(expr::Any)
   return Set{Variable}(), Set{Variable}()
 end
 
-function remove_unused(ast::Expr)
+function remove_unused!(ast::Expr)
   # println("Used, def")
   cleaned = false
   while !cleaned

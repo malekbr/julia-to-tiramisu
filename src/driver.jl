@@ -410,9 +410,9 @@ function toTiramisu(func :: GlobalRef, code, signature :: Tuple)
   #Optimization Pass used by ParallelAccelerator. Calls the entrypoint
   #from cgen-tiramisu and creates a proxy function that calls the generated
   #tiramisu function. It is this proxy function that is returned.
-  if ParallelAccelerator.getPseMode() == ParallelAccelerator.THREADS_MODE
-    return code
-  end
+  # if ParallelAccelerator.getPseMode() == ParallelAccelerator.THREADS_MODE
+  #   return code
+  # end
 
   off_time_start = time_ns()
 
