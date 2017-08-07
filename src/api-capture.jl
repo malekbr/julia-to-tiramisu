@@ -6,6 +6,7 @@ import CompilerTools
 import ..API
 import ..operators
 import ..binary_operators
+import ..rename_if_needed
 import ParallelAccelerator
 
 import CompilerTools.DebugMsg
@@ -16,14 +17,14 @@ const binary_operator_set = Set(binary_operators)
 #data_source_num = 0
 
 ref_assign_map = Dict{Symbol, Symbol}(
-    :(+=) => :(+),
-    :(-=) => :(-),
-    :(*=) => :(*),
-    :(/=) => :(/),
-    :(.+=) => :(.+),
-    :(.-=) => :(.-),
-    :(.*=) => :(.*),
-    :(./=) => :(./)
+    :(+=) => :pa_api_add,
+    :(-=) => :pa_api_sub,
+    :(*=) => :pa_api_mul,
+    :(/=) => :pa_api_div,
+    :(.+=) => :pa_api_elem_add,
+    :(.-=) => :pa_api_elem_sub,
+    :(.*=) => :pa_api_elem_mul,
+    :(./=) => :pa_api_elem_div
 )
 
 type process_node_state
@@ -81,7 +82,6 @@ function process_node(node::Expr, state, top_level_number, is_top_level, read)
         rhs)),
         Expr(:call, GlobalRef(API, :setindex!), lhs, tmpvar, idx...),
         tmpvar]
-
     elseif haskey(ref_assign_map, head) 
         # x += ...
         lhs = node.args[1]
@@ -110,7 +110,8 @@ end
 
 
 function process_operator(node::Expr, opr::Symbol)
-    api_opr = GlobalRef(API, opr)
+    rename_opr = rename_if_needed(opr)
+    api_opr = GlobalRef(API, rename_opr)
     if in(opr, operators)
         node.args[1] = api_opr
     end
@@ -157,10 +158,10 @@ end
 function translate_par(args)
     na = length(args)
     @assert (na > 0) "Expect a for loop as argument to @par"
-    redVars = Array(Symbol, na-1)
-    redOps = Array(Symbol, na-1)
+    redVars = Array{Symbol}(na-1)
+    redOps = Array{Symbol}(na-1)
     loop = args[end]
-    if !isa(loop,Expr) || !is(loop.head,:for)
+    if !isa(loop,Expr) || !(loop.head === :for)
         error("malformed @par loop")
     end
     if !isa(loop.args[1], Expr) 
@@ -183,10 +184,10 @@ function translate_par(args)
     end
     ndim = length(loopheads)
     body = loop.args[2]
-    params = Array(Symbol, ndim)
-    indices = Array(Symbol, ndim)
-    ranges = Array(Any, ndim)
-    headers = Array(Any, ndim)
+    params = Array{Symbol}(ndim)
+    indices = Array{Symbol}(ndim)
+    ranges = Array{Any}(ndim)
+    headers = Array{Any}(ndim)
     for i = 1:ndim
         r = loopheads[i]
         assert(r.head == :(=))
@@ -228,6 +229,9 @@ function translate_par(args)
         redArg = gensym(string(redVar))
         opr = redOps[i]
         if in(opr, operators)
+            if haskey(API.rename_forward, opr)
+                opr = API.rename_forward[opr]
+            end
             opr = GlobalRef(API, opr)
         end
         redBody = Expr(:(=), redVars[i], Expr(:call, opr, redVar, redArg))
@@ -247,7 +251,7 @@ function isStart1UnitRange(node::Expr)
 end
 
 function process_par_macro(node::Expr, state, top_level_number, is_top_level, read)
-    if is(node.head, :macrocall) 
+    if node.head === :macrocall
         #println("got par macro, args = ", node.args)
         if node.args[1] == Symbol("@par")
             ast = translate_par(node.args[2:end])

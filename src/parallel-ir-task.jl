@@ -459,7 +459,7 @@ function generate_instr_count(function_name, signature)
     @dprintln(2,"generate_instr_count ", function_name, " ", signature)
     state = eic_state(0, true, nothing)
     # Try to estimate the instruction count for the other function.
-    AstWalk(ct[1], estimateInstrCount, state)
+    AstWalk(ct, estimateInstrCount, state)
     @dprintln(2,"instruction count estimate for parfor = ", state)
     # If so then cache the result.
     if state.fully_analyzed
@@ -712,7 +712,7 @@ function divide_fis(full_iteration_space :: ParallelAccelerator.ParallelIR.pir_r
 #    @dprintln(3, "divide_fis space = ", full_iteration_space, " numtotal = ", numtotal)
     dims = sort(dimlength[dimlength(i, full_iteration_space.upper_bounds[i] - full_iteration_space.lower_bounds[i] + 1)  for i = 1:full_iteration_space.dim], by=x->x.len, rev=true)
 #    @dprintln(3, "dims = ", dims)
-    assignments = Array(ParallelAccelerator.ParallelIR.pir_range_actual, numtotal)
+    assignments = Array{ParallelAccelerator.ParallelIR.pir_range_actual}(numtotal)
     divide_work(full_iteration_space, assignments, isf_range[], 1, numtotal, dims, 1)
     return assignments
 end
@@ -985,7 +985,7 @@ function getIO(stmt_ids, bb_statements)
     outputs = setdiff(intersect(cur_defs, stmts_for_ids[end].live_out), IntrinsicSet)
     @dprintln(3, "outputs = ", outputs)
     cur_defs = setdiff(cur_defs, IntrinsicSet)
-    cur_inputs = setdiff(filter(x -> !(is(x, :Int64) || is(x, :Float32)), cur_inputs), IntrinsicSet)
+    cur_inputs = setdiff(filter(x -> !((x === :Int64) || (x === :Float32)), cur_inputs), IntrinsicSet)
     # The locals are those things defined that aren't inputs or outputs of the function.
     cur_inputs, outputs, setdiff(cur_defs, union(cur_inputs, outputs))
 end
@@ -1422,7 +1422,7 @@ function recreateLoopsInternal(new_body, the_parfor :: ParallelAccelerator.Paral
         end
 
         line_num = addToBody!(new_body, mk_gotoifnot_expr(
-               Expr(:call, GlobalRef(Base, :box), GlobalRef(Base, :Bool), 
+               boxOrNot(GlobalRef(Base, :Bool), 
                    Expr(:call, GlobalRef(Base, :not_int),
                            Expr(:call, GlobalRef(Base, :or_int), 
                                    Expr(:call, GlobalRef(Base, :and_int), 
@@ -1443,7 +1443,7 @@ function recreateLoopsInternal(new_body, the_parfor :: ParallelAccelerator.Paral
                                            )
                                    ),
                                Expr(:call, GlobalRef(Base, :(===)), deepcopy(recreate_temp_rhsvar), 
-                                   Expr(:call, GlobalRef(Base, :box), Int64, Expr(:call, GlobalRef(Base, :add_int), deepcopy(steprange_last_rhsvar), deepcopy(steprange_step_rhsvar))) 
+                                   boxOrNot(Int64, Expr(:call, GlobalRef(Base, :add_int), deepcopy(steprange_last_rhsvar), deepcopy(steprange_step_rhsvar))) 
                                )
                            )
                        )
@@ -1451,7 +1451,7 @@ function recreateLoopsInternal(new_body, the_parfor :: ParallelAccelerator.Paral
                , label_end), line_num) # 6
 
         line_num = addToBody!(new_body, mk_assignment_expr(deepcopy(recreate_ssa5_lhsvar), deepcopy(recreate_temp_rhsvar), newLambdaVarInfo), line_num) # 7
-        line_num = addToBody!(new_body, mk_assignment_expr(deepcopy(recreate_ssa6_lhsvar), Expr(:call, GlobalRef(Base, :box), Int64, Expr(:call, GlobalRef(Base, :add_int), deepcopy(recreate_temp_rhsvar), deepcopy(steprange_step_rhsvar))), newLambdaVarInfo), line_num) # 8
+        line_num = addToBody!(new_body, mk_assignment_expr(deepcopy(recreate_ssa6_lhsvar), boxOrNot(Int64, Expr(:call, GlobalRef(Base, :add_int), deepcopy(recreate_temp_rhsvar), deepcopy(steprange_step_rhsvar))), newLambdaVarInfo), line_num) # 8
         @dprintln(3, "this_nest.indexVariable = ", this_nest.indexVariable, " type = ", typeof(this_nest.indexVariable))
         line_num = addToBody!(new_body, mk_assignment_expr(CompilerTools.LambdaHandling.toLHSVar(deepcopy(this_nest.indexVariable), newLambdaVarInfo), deepcopy(recreate_ssa5_rhsvar), newLambdaVarInfo), line_num) # 9
         line_num = addToBody!(new_body, mk_assignment_expr(deepcopy(recreate_temp_lhsvar), deepcopy(recreate_ssa6_rhsvar), newLambdaVarInfo), line_num) # 10
@@ -1650,6 +1650,7 @@ function parforToTask(parfor_index, bb_statements, body, state)
     @dprintln(3,"out_vars = ", out, " type = ", typeof(out))
     locals = collect(locals)
     @dprintln(3,"local_vars = ", locals, " type = ", typeof(locals))
+    # The following 8 lines if just for debugging purposes.
     in_vars_sym = [lookupVariableName(x, state.LambdaVarInfo) for x in in_vars]
     out_vars_sym = [lookupVariableName(x, state.LambdaVarInfo) for x in out]
     locals_vars_sym = [lookupVariableName(x, state.LambdaVarInfo) for x in locals]
@@ -1659,7 +1660,7 @@ function parforToTask(parfor_index, bb_statements, body, state)
     @dprintln(3,"local_vars names= ", locals_vars_sym)
     @dprintln(3,"reduction_vars names= ", reduction_vars_sym)
 
-    parfor_rws = CompilerTools.ReadWriteSet.from_exprs(the_parfor.body, pir_rws_cb, state.LambdaVarInfo)
+    parfor_rws = CompilerTools.ReadWriteSet.from_exprs(the_parfor.body, pir_rws_cb, state.LambdaVarInfo, state.LambdaVarInfo)
 
     # Convert Set to Array
     in_array_names   = LHSVar[]
@@ -1723,6 +1724,20 @@ function parforToTask(parfor_index, bb_statements, body, state)
     addToTaskFunc!(io_symbols, oldToTaskMap, state.LambdaVarInfo, newLambdaVarInfo)
     addToTaskFunc!(reduction_vars, oldToTaskMap, state.LambdaVarInfo, newLambdaVarInfo)
     addToTaskFunc!(locals, oldToTaskMap, state.LambdaVarInfo, newLambdaVarInfo)
+
+if false
+    rn = 0
+    for ian in in_array_names
+        map_entry = oldToTaskMap[ian]
+        tm = string(map_entry.name)
+        @dprintln(3,"map_entry = ", map_entry, " type = ", typeof(map_entry), " tm = ", tm, " type = ", typeof(tm))
+        if contains(tm, "#")
+            rn += 1
+            map_entry.name = Symbol("replacement_arg_" * string(rn))
+            @dprintln(3,"replaced ", tm, " with ", map_entry.name)
+        end
+    end
+end
 
     # Create the oldToNewMap as described above.
     for old in oldToTaskMap
@@ -1802,7 +1817,7 @@ function parforToTask(parfor_index, bb_statements, body, state)
     @dprintln(3,"task_func = ", task_func)
 
     # DON'T DELETE.  Forces function into existence.
-    unused_ct = ParallelAccelerator.Driver.code_typed(task_func, all_arg_type)[1]
+    unused_ct = ParallelAccelerator.Driver.code_typed(task_func, all_arg_type)
     @dprintln(3, "unused_ct = ", unused_ct, " type = ", typeof(unused_ct))
     newLambdaVarInfo.orig_info = unused_ct
 
@@ -1937,18 +1952,16 @@ function parforToTask(parfor_index, bb_statements, body, state)
 
     if DEBUG_LVL >= 3
         task_func_ct = ParallelAccelerator.Driver.code_typed(task_func, all_arg_type)
-        if length(task_func_ct) == 0
-            println("Error getting task func code.\n")
-        else
-            task_func_ct = task_func_ct[1]
-            println("Task func code for ", task_func)
-            println(task_func_ct)    
-            println("code = ", code)
-            println(CompilerTools.LambdaHandling.getBody(code))   
-            println(newLambdaVarInfo)   
+        println("Task func code for ", task_func)
+        println(task_func_ct, " type = ", typeof(task_func_ct))    
+        println("code = ", code)
+        debug_lvi = CompilerTools.LambdaHandling.lambdaToLambdaVarInfo(task_func_ct)
+        #println(newLambdaVarInfo)   
+        println("debug_lvi = ", code)
+        println(debug_lvi)   
+        println(CompilerTools.LambdaHandling.getBody(task_func_ct))   
 
-            ParallelAccelerator.Driver.code_llvm(task_func, all_arg_type)
-        end
+        ParallelAccelerator.Driver.code_llvm(task_func, all_arg_type)
     end
 #throw(string("stop here"))
 
@@ -1976,6 +1989,3 @@ function seqTask(body_indices, bb_statements, body, state)
     throw(string("seqTask construction not implemented yet."))
     TaskInfo(:FIXFIXFIX, :FIXFIXFIX, Any[], Any[], nothing, PIRLoopNest[])
 end
-
-
-

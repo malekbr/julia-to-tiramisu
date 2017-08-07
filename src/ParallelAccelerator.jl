@@ -84,29 +84,72 @@ function get_num_acc_parfors()
 end
 
 """
+Generate a file path to the directory above the one containing this source file.
+This should be the root of the package.
+"""
+function getPackageRoot()
+  joinpath(dirname(@__FILE__), "..")
+end
+
+const USE_ICC = 0
+const USE_GCC = 1
+const USE_MINGW = 2
+const NONE = 3
+
+use_bcpp = 0
+backend_compiler = USE_ICC
+mkl_lib = ""
+openblas_lib = ""
+sys_blas = 0
+openmp_supported = 0
+package_root = getPackageRoot()
+
+#config file overrides backend_compiler variable
+if isfile("$package_root/deps/generated/config.jl")
+  include("$package_root/deps/generated/config.jl")
+end
+
+cached_mode = nothing
+
+"""
 Return internal mode number by looking up environment variable "PROSPECT_MODE".
 """
 function getPseMode()
-  if haskey(ENV,"PROSPECT_MODE")
-     mode = ENV["PROSPECT_MODE"]
-  else
-     mode = "host"
-  end
-  if mode == "none" || mode == "off"
-    OFF_MODE
-  elseif mode == "host"
-    HOST_MODE
-  elseif mode == "offload1"
-    OFFLOAD1_MODE
-  elseif mode == "offload2"
-    OFFLOAD2_MODE
-  elseif mode == "task"
-    TASK_MODE
-  elseif mode == "threads"
-    THREADS_MODE
-  else
-    error(string("Unknown PROSPECT_MODE = ", mode))
-  end
+    global cached_mode
+    if cached_mode == nothing
+        if haskey(ENV,"PROSPECT_MODE")
+            env_mode = ENV["PROSPECT_MODE"]
+            if (env_mode == "cgen" || env_mode == "offload1" || env_mode == "offload2" || env_mode == "task") && backend_compiler == NONE
+                println("ParallelAccelerator backend CGen requested but no C compiler is installed...")
+                println("...reverting to Julia native threading backend.")
+                ENV["PROSPECT_MODE"] = "threads"
+            end
+        end
+
+        if haskey(ENV,"PROSPECT_MODE")
+           mode = ENV["PROSPECT_MODE"]
+        else
+           mode = "threads"
+        end
+
+        if mode == "none" || mode == "off"
+          cached_mode = OFF_MODE
+        elseif mode == "cgen"
+          cached_mode = HOST_MODE
+        elseif mode == "offload1"
+          cached_mode = OFFLOAD1_MODE
+        elseif mode == "offload2"
+          cached_mode = OFFLOAD2_MODE
+        elseif mode == "task"
+          cached_mode = TASK_MODE
+        elseif mode == "threads"
+          cached_mode = THREADS_MODE
+        else
+          error(string("Unknown PROSPECT_MODE = ", mode))
+        end
+    end
+
+    return cached_mode
 end
 
 """
@@ -163,14 +206,6 @@ function getTaskMode()
   end
 end
 
-"""
-Generate a file path to the directory above the one containing this source file.
-This should be the root of the package.
-"""
-function getPackageRoot()
-  joinpath(dirname(@__FILE__), "..")
-end
-
 type UnsupportedFeature <: Exception
   text :: AbstractString
 end
@@ -203,6 +238,10 @@ function embed(julia_root)
 Base.reinit_stdio()
 
 include("$current_file")
+
+# This is to force the target of CGen's atexit hook to transitively compile so that
+# compilation will not be attempted atexit time during Julia's build process.
+ParallelAccelerator.CGen.CGen_finalize()
 
 module __UserimgDummyModule__
 
@@ -279,7 +318,6 @@ include("parallel-ir.jl")
 include("j2c-array.jl")
 include("cgen.jl")
 include("cgen-tiramisu.jl")
-include("callgraph.jl")
 include("comprehension.jl")
 include("driver.jl")
 

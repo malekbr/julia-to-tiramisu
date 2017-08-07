@@ -50,10 +50,10 @@ function findAllocations(x :: Expr, state :: findAllocationsState, top_level_num
     if isArraysetCall(x)
         value = x.args[3]   # the value written into the array
         vtyp  = CompilerTools.LambdaHandling.getType(value, state.LambdaVarInfo)
-        @dprintln(3, "findAllocations found arrayset with value ", value, " of type ", vtyp)
-        if isArrayType(vtyp) && isa(value, LHSVar)
+        @dprintln(3, "findAllocations found arrayset with value ", value, " of type ", vtyp, " ", isArrayType(vtyp), " ", typeof(value))
+        if isArrayType(vtyp) && isa(value, RHSVar)
             @dprintln(3, "findAllocations added ", value, " to set")
-            push!(state.arrays_stored_in_arrays, value)
+            push!(state.arrays_stored_in_arrays, toLHSVar(value))
         end
     end
     return CompilerTools.AstWalker.ASTWALK_RECURSE
@@ -88,8 +88,8 @@ function hoistAllocation(ast::Array{Any,1}, lives, domLoop::DomLoops, state :: e
             end
         end
 
-        #if (is(preBlk, nothing) || length(preBlk.statements) == 0) continue end
-        if is(preBlk, nothing) continue end
+        #if ((preBlk === nothing) || length(preBlk.statements) == 0) continue end
+        if (preBlk === nothing) continue end
         tls = lives.basic_blocks[ preBlk ]
 
         # sometimes the preBlk has no statements
@@ -228,7 +228,7 @@ function remove_no_deps(node :: Expr, data :: RemoveNoDepsState, top_level_numbe
 
         live_info = CompilerTools.LivenessAnalysis.find_top_number(top_level_number, data.lives)
         # Remove line number statements.
-        if head == :line
+        if head == :line || head == :meta
             return CompilerTools.AstWalker.ASTWALK_REMOVE
         end
         if live_info == nothing
@@ -247,7 +247,7 @@ function remove_no_deps(node :: Expr, data :: RemoveNoDepsState, top_level_numbe
                 rhs = node.args[2]
                 @dprintln(4,rhs)
 
-                if isa(rhs, Expr) && (is(rhs.head, :parfor) || is(rhs.head, :mmap!))
+                if isa(rhs, Expr) && ((rhs.head === :parfor) || (rhs.head === :mmap!))
                     # Always keep parfor assignment in order to work with fusion
                     @dprintln(3, "keep assignment due to parfor or mmap! node")
                     return node
@@ -499,22 +499,12 @@ function remove_dead(node::PIRParForAst, data::RemoveDeadState, top_level_number
         @dprintln(3,"remove_dead is_top_level parfor")
         live_info = CompilerTools.LivenessAnalysis.find_top_number(top_level_number, data.lives)
         if live_info != nothing
-            # live_out variables of the parfor are added to live_out of all
-            # basic blocks and statements so remove_dead doesn't remove them
             parfor_live_out = live_info.live_out
             @dprintln(3,"remove_dead parfor live_out = ", parfor_live_out)
-            body_lives = CompilerTools.LivenessAnalysis.from_lambda(data.linfo, node.body, pir_live_cb, data.linfo)
-            @dprintln(3,"remove_dead parfor body lives = ", body_lives)
-            for bb in body_lives.basic_blocks
-                bb[2].live_out = union(parfor_live_out, bb[2].live_out)
-                stmts = bb[2].statements
-                for j = 1:length(stmts)
-                    stmts[j].live_out = union(parfor_live_out, stmts[j].live_out)
-                end
-            end
-            # body can now be traversed using exteneded liveness info
-            new_body = AstWalk(TypedExpr(nothing, :body, node.body...), remove_dead, RemoveDeadState(body_lives,data.linfo))
-            node.body = new_body.args
+            # node.preParFor = remove_dead_recursive_body(node.preParFor, data.linfo, parfor_live_out)
+            # node.hoisted = remove_dead_recursive_body(node.hoisted, data.linfo, parfor_live_out)
+            node.body = remove_dead_recursive_body(node.body, data.linfo, parfor_live_out)
+            # node.postParFor = remove_dead_recursive_body(node.postParFor, data.linfo, parfor_live_out)
             return node
         end
     end
@@ -522,6 +512,23 @@ end
 
 function remove_dead(node::ANY, data :: RemoveDeadState, top_level_number, is_top_level, read)
     return CompilerTools.AstWalker.ASTWALK_RECURSE
+end
+
+function remove_dead_recursive_body(body, linfo, parfor_live_out)
+    body_lives = CompilerTools.LivenessAnalysis.from_lambda(linfo, body, pir_live_cb, linfo)
+    @dprintln(3,"remove_dead parfor body lives = ", body_lives)
+    # live_out variables of the parfor are added to live_out of all
+    # basic blocks and statements so remove_dead doesn't remove them
+    for bb in body_lives.basic_blocks
+        bb[2].live_out = union(parfor_live_out, bb[2].live_out)
+        stmts = bb[2].statements
+        for j = 1:length(stmts)
+            stmts[j].live_out = union(parfor_live_out, stmts[j].live_out)
+        end
+    end
+    # body can now be traversed using exteneded liveness info
+    new_body = AstWalk(TypedExpr(nothing, :body, body...), remove_dead, RemoveDeadState(body_lives,linfo))
+    return new_body.args
 end
 
 """
@@ -536,13 +543,9 @@ type TransposePropagateState
     end
 end
 
-function transpose_propagate(node :: ANY, data :: TransposePropagateState, top_level_number, is_top_level, read)
+function transpose_propagate(node::ANY, data::TransposePropagateState, top_level_number, is_top_level, read)
     @dprintln(3,"transpose_propagate starting top_level_number = ", top_level_number, " is_top = ", is_top_level)
-    @dprintln(3,"transpose_propagate node = ", node, " type = ", typeof(node))
-    if typeof(node) == Expr
-        @dprintln(3,"node.head = ", node.head)
-    end
-    ntype = typeof(node)
+    @dprintln(3,"transpose_propagate node = ", node)
 
     if is_top_level
         @dprintln(3,"transpose_propagate is_top_level")
@@ -566,73 +569,91 @@ function transpose_propagate(node :: ANY, data :: TransposePropagateState, top_l
                 end
             end
         end
-
-        if isa(node, LabelNode) || isa(node, GotoNode) || (isa(node, Expr) && is(node.head, :gotoifnot))
-            # Only transpose propagate within a basic block.  this is now a new basic block.
-            empty!(data.transpose_map)
-        elseif isAssignmentNode(node) && isCall(node.args[2])
-            @dprintln(3,"Is an assignment call node.")
-            lhs = toLHSVar(node.args[1])
-            rhs = node.args[2]
-            func = getCallFunction(rhs)
-            if func==GlobalRef(Base,:transpose!)
-                @dprintln(3,"transpose_propagate transpose! found.")
-                args = getCallArguments(rhs)
-                original_matrix = toLHSVar(args[2])
-                transpose_var1 = toLHSVar(args[1])
-                transpose_var2 = lhs
-                data.transpose_map[transpose_var1] = original_matrix
-                data.transpose_map[transpose_var2] = original_matrix
-            elseif func==GlobalRef(Base,:transpose)
-                @dprintln(3,"transpose_propagate transpose found.")
-                args = getCallArguments(rhs)
-                original_matrix = toLHSVar(args[1])
-                transpose_var = lhs
-                data.transpose_map[transpose_var] = original_matrix
-            elseif func==GlobalRef(Base.LinAlg,:gemm_wrapper!)
-                @dprintln(3,"transpose_propagate GEMM found.")
-                args = getCallArguments(rhs)
-                A = toLHSVar(args[4])
-                if haskey(data.transpose_map, A)
-                    args[4] = data.transpose_map[A]
-                    args[2] = 'T'
-                    @dprintln(3,"transpose_propagate GEMM replace transpose arg 1.")
-                end
-                B = toLHSVar(args[5])
-                if haskey(data.transpose_map, B)
-                    args[5] = data.transpose_map[B]
-                    args[3] = 'T'
-                    @dprintln(3,"transpose_propagate GEMM replace transpose arg 2.")
-                end
-                rhs.args = rhs.head == :invoke ? [ rhs.args[1:2]; args ] : [ rhs.args[1]; args ]
-            elseif func==GlobalRef(Base.LinAlg,:gemv!)
-                args = getCallArguments(rhs)
-                A = toLHSVar(args[3])
-                if haskey(data.transpose_map, A)
-                    args[3] = data.transpose_map[A]
-                    args[2] = 'T'
-                end
-                rhs.args = rhs.head == :invoke ? [ rhs.args[1:2]; args ] : [ rhs.args[1]; args ]
-            # replace arraysize() calls to the transposed matrix with original
-            elseif isBaseFunc(func, :arraysize)
-                args = getCallArguments(rhs)
-                if haskey(data.transpose_map, args[1])
-                    args[1] = data.transpose_map[args[1]]
-                    if args[2] ==1
-                        args[2] = 2
-                    elseif args[2] ==2
-                        args[2] = 1
-                    else
-                        throw("transpose_propagate matrix dim error")
-                    end
-                end
-                rhs.args = rhs.head == :invoke ? [ rhs.args[1:2]; args ] : [ rhs.args[1]; args ]
-            end
-            return node
-        end
     end
+    return transpose_propagate_helper(node, data)
+end
 
+function transpose_propagate_helper(node::Expr, data::TransposePropagateState)
+
+    if (node.head === :gotoifnot)
+        # Only transpose propagate within a basic block.  this is now a new basic block.
+        empty!(data.transpose_map)
+    elseif isAssignmentNode(node) && isCall(node.args[2])
+        @dprintln(3,"Is an assignment call node.")
+        lhs = toLHSVar(node.args[1])
+        rhs = node.args[2]
+        func = getCallFunction(rhs)
+        if isBaseFunc(func,:transpose!)
+            @dprintln(3,"transpose_propagate transpose! found.")
+            args = getCallArguments(rhs)
+            original_matrix = toLHSVar(args[2])
+            transpose_var1 = toLHSVar(args[1])
+            transpose_var2 = lhs
+            data.transpose_map[transpose_var1] = original_matrix
+            data.transpose_map[transpose_var2] = original_matrix
+        elseif isBaseFunc(func,:transpose)
+            @dprintln(3,"transpose_propagate transpose found.")
+            args = getCallArguments(rhs)
+            original_matrix = toLHSVar(args[1])
+            transpose_var = lhs
+            data.transpose_map[transpose_var] = original_matrix
+        elseif isBaseFunc(func,:gemm_wrapper!)
+            @dprintln(3,"transpose_propagate GEMM found.")
+            args = getCallArguments(rhs)
+            A = toLHSVar(args[4])
+            if haskey(data.transpose_map, A)
+                args[4] = data.transpose_map[A]
+                args[2] = 'T'
+                @dprintln(3,"transpose_propagate GEMM replace transpose arg 1.")
+            end
+            B = toLHSVar(args[5])
+            if haskey(data.transpose_map, B)
+                args[5] = data.transpose_map[B]
+                args[3] = 'T'
+                @dprintln(3,"transpose_propagate GEMM replace transpose arg 2.")
+            end
+            rhs.args = rhs.head == :invoke ? [ rhs.args[1:2]; args ] : [ rhs.args[1]; args ]
+        elseif isBaseFunc(func,:gemv!)
+            args = getCallArguments(rhs)
+            A = toLHSVar(args[3])
+            if haskey(data.transpose_map, A)
+                args[3] = data.transpose_map[A]
+                args[2] = 'T'
+            end
+            rhs.args = rhs.head == :invoke ? [ rhs.args[1:2]; args ] : [ rhs.args[1]; args ]
+        # replace arraysize() calls to the transposed matrix with original
+        elseif isBaseFunc(func, :arraysize)
+            args = getCallArguments(rhs)
+            if haskey(data.transpose_map, args[1])
+                args[1] = data.transpose_map[args[1]]
+                if args[2] ==1
+                    args[2] = 2
+                elseif args[2] ==2
+                    args[2] = 1
+                else
+                    throw("transpose_propagate matrix dim error")
+                end
+            end
+            rhs.args = rhs.head == :invoke ? [ rhs.args[1:2]; args ] : [ rhs.args[1]; args ]
+        end
+        return node
+    end
     return CompilerTools.AstWalker.ASTWALK_RECURSE
+end
+
+function transpose_propagate_helper(node::Union{LabelNode,GotoNode}, data::TransposePropagateState)
+    # Only transpose propagate within a basic block.  this is now a new basic block.
+    empty!(data.transpose_map)
+    return CompilerTools.AstWalker.ASTWALK_RECURSE
+end
+
+function transpose_propagate_helper(node::ANY, data::TransposePropagateState)
+    return CompilerTools.AstWalker.ASTWALK_RECURSE
+end
+
+# don't recurse inside DomainLambda
+function transpose_propagate_helper(node::DomainLambda, data::TransposePropagateState)
+    return node
 end
 
 const max_unroll_size = 12
@@ -659,12 +680,13 @@ function unroll_const_parfors(node::Expr, data, top_level_number, is_top_level, 
         end
         @dprintln(3,"unroll_const_parfors unrolling parfor ", node)
         out = deepcopy(parfor.preParFor)
+        append!(out, deepcopy(parfor.hoisted))
         for i in lower:step:upper
             body = deepcopy(parfor.body)
             replaceExprWithDict!(body, Dict{LHSVar,Any}(toLHSVar(indexVariable)=>i), nothing, AstWalk)
             append!(out,body)
         end
-        append!(out, parfor.postParFor)
+        append!(out, deepcopy(parfor.postParFor))
         return Expr(:block, out...)
     end
     return CompilerTools.AstWalker.ASTWALK_RECURSE
@@ -819,8 +841,27 @@ function copy_propagate_helper(node::Expr,
             end
         end
         return node
+    elseif isCall(node)
+        return evaluate_constant_calls(node)
     end
 
+    return CompilerTools.AstWalker.ASTWALK_RECURSE
+end
+
+function evaluate_constant_calls(node::Expr)
+    @assert isCall(node) "call Expr expected"
+    func = getCallFunction(node)
+    args = getCallArguments(node)
+    if func==GlobalRef(Core.Intrinsics,:xor_int) && isa(args[1],Int) && isa(args[2],Int)
+        @dprintln(3,"copy_propagate replacing constant call Core.Intrinsics.xor_int = ", node)
+        return eval(quote Core.Intrinsics.xor_int($(args[1]), $(args[2])) end )
+    elseif func==GlobalRef(Core.Intrinsics,:flipsign_int) && isa(args[1],Int) && isa(args[2],Int)
+        @dprintln(3,"copy_propagate replacing constant call Core.Intrinsics.flipsign_int = ", node)
+        return eval(quote Core.Intrinsics.flipsign_int($(args[1]), $(args[2])) end )
+    elseif func==GlobalRef(Core.Intrinsics,:box) && isa(args[2],Number) && typeof(args[2])==args[1]
+        @dprintln(3,"copy_propagate replacing constant call Core.Intrinsics.box = ", node)
+        return args[2]
+    end
     return CompilerTools.AstWalker.ASTWALK_RECURSE
 end
 
@@ -941,6 +982,17 @@ function create_equivalence_classes_assignment(lhs::RHSVar, rhs::RHSVar, state)
     CompilerTools.AstWalker.ASTWALK_RECURSE
 end
 
+function sizeNoTuples(x, state)
+    for s in x
+        stype = CompilerTools.LambdaHandling.getType(s, state.LambdaVarInfo)  # get size type
+        if stype <: Tuple
+            @dprintln(3,"Found Tuple in sizes for array correlation.")
+            return false
+        end
+    end
+    return true
+end
+
 function create_equivalence_classes_assignment(lhs, rhs::Expr, state)
     @dprintln(4,lhs)
     @dprintln(4,rhs)
@@ -955,8 +1007,31 @@ function create_equivalence_classes_assignment(lhs, rhs::Expr, state)
         sizes = Any[ x for x in rhs.args[2]]
         n = length(sizes)
         assert(n >= 1 && n <= 3)
-        @dprintln(3, "Detected :alloc array allocation. dims = ", sizes)
-        checkAndAddSymbolCorrelation(lhs, state, sizes)
+        if sizeNoTuples(sizes, state)
+            @dprintln(3, "Detected :alloc array allocation. dims = ", sizes)
+            checkAndAddSymbolCorrelation(lhs, state, sizes)
+        end
+    elseif rhs.head == :foreigncall
+        fun = rhs.args[1]
+        args = rhs.args[2:end]
+        @dprintln(3, "Detected foreigncall rhs in from_assignment.")
+        @dprintln(3, "fun = ", fun, " args = ", args)
+        if fun == QuoteNode(:jl_alloc_array_1d)
+            dim1 = args[5]
+            @dprintln(3, "Detected 1D array allocation. dim1 = ", dim1, " type = ", typeof(dim1))
+            checkAndAddSymbolCorrelation(lhs, state, Any[dim1])
+        elseif fun == QuoteNode(:jl_alloc_array_2d)
+            dim1 = args[5]
+            dim2 = args[7]
+            @dprintln(3, "Detected 2D array allocation. dim1 = ", dim1, " dim2 = ", dim2)
+            checkAndAddSymbolCorrelation(lhs, state, Any[dim1, dim2])
+        elseif fun == QuoteNode(:jl_alloc_array_3d)
+            dim1 = args[5]
+            dim2 = args[7]
+            dim3 = args[9]
+            @dprintln(3, "Detected 2D array allocation. dim1 = ", dim1, " dim2 = ", dim2, " dim3 = ", dim3)
+            checkAndAddSymbolCorrelation(lhs, state, Any[dim1, dim2, dim3])
+        end
     elseif isCall(rhs)
         @dprintln(3, "Detected call rhs in from_assignment.")
         @dprintln(3, "from_assignment call, arg1 = ", rhs.args[1])
@@ -983,11 +1058,30 @@ function create_equivalence_classes_assignment(lhs, rhs::Expr, state)
                 @dprintln(3, "Detected 2D array allocation. dim1 = ", dim1, " dim2 = ", dim2, " dim3 = ", dim3)
                 checkAndAddSymbolCorrelation(lhs, state, Any[dim1, dim2, dim3])
             end
+        elseif isBaseFunc(fun, :hvcat)
+            dimSizes = [rhs.args[2]...]
+            firstDimSize = dimSizes[1]
+            all_same = true
+            for i = 2:length(dimSizes)
+                if dimSizes[i] != firstDimSize
+                    all_same = false
+                end
+            end
+            if length(dimSizes) > 2
+                @dprintln(1, "hvcat equivalence classes not supported for more than 2 dimensions yet.")
+            elseif !all_same
+                @dprintln(1, "hvcat equivalence classes does not support differing dimensions.")
+            else
+                checkAndAddSymbolCorrelation(lhs, state, Any[length(dimSizes), firstDimSize])
+            end
         elseif isBaseFunc(fun, :vect)
             @dprintln(3, "found vect, args: ", args)
             len = length(args)
             checkAndAddSymbolCorrelation(lhs, state, Any[len])
-        elseif  isBaseFunc(fun, :arraylen)
+        # first arg of gemm/v are assigned to output
+        elseif isBaseFunc(fun, :gemm_wrapper!) || isBaseFunc(fun, :gemv!)
+            return create_equivalence_classes_assignment(lhs, args[1], state)
+        elseif isBaseFunc(fun, :arraylen)
             # This is the other direction.  Takes an array and extract dimensional information that maps to the array's equivalence class.
             array_param = args[1]                  # length takes one param, which is the array
             assert(isa(array_param, RHSVar))
@@ -1016,21 +1110,25 @@ function create_equivalence_classes_assignment(lhs, rhs::Expr, state)
             else
                 throw(string("arraysize AST node didn't have 2 or 3 arguments."))
             end
-        elseif isBaseFunc(fun, :reshape)
+        elseif isBaseFunc(fun, :reshape) || fun==GlobalRef(ParallelAccelerator.API,:reshape)
             # rhs.args[2] is the array to be reshaped, lhs is the result, rhs.args[3] is a tuple with new shape
             if haskey(state.tuple_table, args[2])
+                @dprintln(3,"reshape tuple found in tuple_table = ", state.tuple_table[args[2]])
                 checkAndAddSymbolCorrelation(lhs, state, state.tuple_table[args[2]])
             end
         elseif isBaseFunc(fun, :tuple)
-            ok = true
-            for s in args
-                if !(isa(s,TypedVar) || isa(s,Int))
-                    ok = false
-                end
-            end
-            if ok
-                state.tuple_table[lhs]=args[1:end]
-            end
+            @dprintln(3,"tuple added to tuple_table = ", args)
+            # no need to check since checkAndAddSymbolCorrelation already checks symbols
+            state.tuple_table[lhs]=args
+            #ok = true
+            #for s in args
+            #    if !(isa(s,TypedVar) || isa(s,Int))
+            #        ok = false
+            #    end
+            #end
+            #if ok
+            #    state.tuple_table[lhs]=args[1:end]
+            #end
         end
     elseif rhs.head == :mmap! || rhs.head == :mmap || rhs.head == :map! || rhs.head == :map
         # Arguments to these domain operations implicit assert that equality of sizes so add/merge equivalence classes for the arrays to this operation.
@@ -1079,10 +1177,16 @@ end
 
 function print_correlations(level, state)
     if !isempty(state.array_length_correlation)
-        dprintln(level,"array_length_correlations = ", state.array_length_correlation)
+        dprintln(level,"array_length_correlations = ")
+        for (k,v) in state.array_length_correlation
+            dprintln(level, "    ", k," => ",v)
+        end
     end
     if !isempty(state.symbol_array_correlation)
-        dprintln(level,"symbol_array_correlations = ", state.symbol_array_correlation)
+        dprintln(level,"symbol_array_correlations = ")
+        for (k,v) in state.symbol_array_correlation
+            dprintln(level, "    ", k," => ",v)
+        end
     end
     if !isempty(state.range_correlation)
         dprintln(level,"range_correlations = ")
@@ -1118,8 +1222,11 @@ function create_equivalence_classes(node :: Expr, state :: expr_state, top_level
         return node
     end
 
+    # FIXME: why?
     # We can only extract array equivalences from top-level statements.
-    if is_top_level
+    # get equivalences from non-top-level also
+    # use case: pre statements of parfors in HPAT matrix multiply optimization
+    if true #is_top_level
         @dprintln(3,"create_equivalence_classes is_top_level")
 
         if isAssignmentNode(node)
@@ -1142,6 +1249,13 @@ function create_equivalence_classes(node :: ANY, state :: expr_state, top_level_
     @dprintln(3,"create_equivalence_classes node = ", node, " type = ", typeof(node))
     @dprintln(3,"Not an assignment or expr node.")
     return CompilerTools.AstWalker.ASTWALK_RECURSE
+end
+
+"""
+do not recurse into domain lambdas since there could be variable name conflicts
+"""
+function create_equivalence_classes(node::DomainLambda, state :: expr_state, top_level_number :: Int64, is_top_level :: Bool, read :: Bool)
+    return node
 end
 
 """
@@ -1330,11 +1444,25 @@ function getOrAddRangeCorrelation(array, ranges :: Array{DimensionSelector,1}, s
     end
     print_correlations(3, state)
 
+    num_dims = length(ranges)
+    num_range = 0
+    num_mask = 0
+    num_single = 0
+    masks = MaskSelector[]
+
     # We can't match on array of RangeExprs so we flatten to Array of Any
-    all_mask = true
     for i = 1:length(ranges)
-        all_mask = all_mask & isa(ranges[i], MaskSelector)
+        if isa(ranges[i], MaskSelector)
+            num_mask += 1
+            push!(masks, ranges[i])
+        elseif isa(ranges[i], SingularSelector)
+            num_single += 1
+        else
+            num_range += 1
+        end
     end
+    all_mask = (num_mask == num_dims)
+    @dprintln(3, "Selector Types: ", num_range, " ", num_mask, " ", num_single, " ", all_mask)
 
     if !haskey(state.range_correlation, ranges)
         @dprintln(3,"Exact match for correlation for range not found = ", ranges)
@@ -1342,21 +1470,33 @@ function getOrAddRangeCorrelation(array, ranges :: Array{DimensionSelector,1}, s
         nonExactCorrelation = nonExactRangeSearch(ranges, state.range_correlation)
         if nonExactCorrelation == nothing
             @dprintln(3, "No non-exact match so adding new range")
-            range_corr = addUnknownRange(ranges, state)
-            # If all the dimensions are selected based on masks then the iteration space
-            # is that of the entire array and so we can establish a correlation between the
-            # DimensionSelector and the whole array.
-            if all_mask
-                masked_array_corr = getOrAddArrayCorrelation(toLHSVar(array), state)
-                @dprintln(3, "All dimension selectors are masks so establishing correlation to main array ", masked_array_corr)
-                range_corr = merge_correlations(state, masked_array_corr, range_corr)
 
-                if length(ranges) == 1
-                    print_correlations(3, state)
-                    mask_correlation = getCorrelation(ranges[1].value, state)
+            if num_mask == 1 && num_range == 0 # one mask'ed dimension and all rest singular
+                # If there is only one mask used and all the rest of the dimensions are singular then the
+                # iteration space is equivalent to the mask dimension.  So, we get the mask array and find
+                # out the correlation for that array and make this range have the same correlation.
+                mask_array = masks[1].value
+                mask_correlation = getCorrelation(mask_array, state)
+                state.range_correlation[ranges] = mask_correlation
+                @dprintln(3, "Only one mask dimension and rest singular to correlating this range with mask's correlation.")
+            else
+                range_corr = addUnknownRange(ranges, state)
 
-                    @dprintln(3, "Range length is 1 so establishing correlation between range ", range_corr, " and the mask ", ranges[1].value, " with correlation ", mask_correlation)
-                    range_corr = merge_correlations(state, mask_correlation, range_corr)
+                # If all the dimensions are selected based on masks then the iteration space
+                # is that of the entire array and so we can establish a correlation between the
+                # DimensionSelector and the whole array.
+                if all_mask
+                    masked_array_corr = getOrAddArrayCorrelation(toLHSVar(array), state)
+                    @dprintln(3, "All dimension selectors are masks so establishing correlation to main array ", masked_array_corr)
+                    range_corr = merge_correlations(state, masked_array_corr, range_corr)
+
+                    if length(ranges) == 1
+                        print_correlations(3, state)
+                        mask_correlation = getCorrelation(ranges[1].value, state)
+
+                        @dprintln(3, "Range length is 1 so establishing correlation between range ", range_corr, " and the mask ", ranges[1].value, " with correlation ", mask_correlation)
+                        range_corr = merge_correlations(state, mask_correlation, range_corr)
+                    end
                 end
             end
         else
@@ -1391,16 +1531,34 @@ function getOrAddSymbolCorrelation(array :: LHSVar, state :: expr_state, dims ::
     end
 end
 
+type ReplaceConstArraysizesData
+    lives             :: CompilerTools.LivenessAnalysis.BlockLiveness
+    linfo
+    array_length_correlation
+    symbol_array_correlation
+    saved_available_variables::Vector{LHSVar}
+    # empty for now
+    range_correlation        :: Dict{Array{DimensionSelector,1},Int}
+    function ReplaceConstArraysizesData(lv,li,al,sa)
+        new(lv,li,al,sa,Vector{LHSVar}(),Dict{Array{DimensionSelector,1},Int}())
+    end
+end
+
 """
 Replace arraysize() calls for arrays with known constant sizes.
 Constant size is Int constants, as well as assigned once variables which are
 in symbol_array_correlation. Variables should be assigned before current statement, however.
 """
-function replaceConstArraysizes(node :: Expr, state::expr_state, top_level_number :: Int64, is_top_level :: Bool, read :: Bool)
+function replaceConstArraysizes(node::Expr, data::ReplaceConstArraysizesData, top_level_number::Int64, is_top_level::Bool, read::Bool)
     @dprintln(4,"replaceConstArraysizes starting top_level_number = ", top_level_number, " is_top = ", is_top_level)
     @dprintln(4,"replaceConstArraysizes node = ", node, " type = ", typeof(node))
     @dprintln(4,"node.head: ", node.head)
-    print_correlations(4, state)
+    print_correlations(4, data)
+
+    if node.head==:parfor
+        replaceConstArraysizes_parfor(node.args[1], data, top_level_number)
+        return node
+    end
 
     if !isCall(node) return CompilerTools.AstWalker.ASTWALK_RECURSE end
     func = getCallFunction(node)
@@ -1409,20 +1567,21 @@ function replaceConstArraysizes(node :: Expr, state::expr_state, top_level_numbe
     end
 
     @dprintln(3, "replaceConstArraysizes size call found ", node)
-    live_info = CompilerTools.LivenessAnalysis.find_top_number(top_level_number, state.block_lives)
+    live_info = CompilerTools.LivenessAnalysis.find_top_number(top_level_number, data.lives)
     @dprintln(3, "replaceConstArraysizes live info ", live_info)
     args = getCallArguments(node)
     arr = toLHSVar(args[1])
     # get array sizes if available, there could be multiple
-    size_syms_arr = get_array_correlation_symbols(arr, state)
+    size_syms_arr = get_array_correlation_symbols(arr, data)
 
     if length(size_syms_arr)==0
         @dprintln(3, "replaceConstArraysizes correlation symbol not found ", node)
+        print_correlations(3, data)
         return CompilerTools.AstWalker.ASTWALK_RECURSE
     end
     @dprintln(3, "replaceConstArraysizes correlation symbols: ", size_syms_arr)
     # need to make sure size variables are available in this statement to replace
-    available_variables = get_available_variables(top_level_number, state)
+    available_variables = get_available_variables(top_level_number, data)
 
     if isBaseFunc(getCallFunction(node), :arraysize)
         dim_ind = args[2] # dimension number
@@ -1457,14 +1616,26 @@ function replaceConstArraysizes(node :: Expr, state::expr_state, top_level_numbe
     return CompilerTools.AstWalker.ASTWALK_RECURSE
 end
 
-function get_available_variables(top_level_number, state)
+function replaceConstArraysizes_parfor(parfor::PIRParForAst, data, top_level_number)
+    body_lives = CompilerTools.LivenessAnalysis.from_lambda(data.linfo, parfor.body, pir_live_cb, data.linfo)
+    available_variables = get_available_variables(top_level_number, data)
+    new_data = ReplaceConstArraysizesData(body_lives, data.linfo,
+       data.array_length_correlation, data.symbol_array_correlation)
+    new_data.saved_available_variables = union(available_variables, data.saved_available_variables)
+    @dprintln(3,"replaceConstArraysizes parfor body lives = ", data.lives)
+    new_body = AstWalk(TypedExpr(nothing, :body, parfor.body...), replaceConstArraysizes, new_data)
+    parfor.body = new_body.args
+end
+
+function get_available_variables(top_level_number, data)
     # get dominant block information
-    dom_dict = CompilerTools.CFGs.compute_dominators(state.block_lives.cfg)
-    bb_index = CompilerTools.LivenessAnalysis.find_bb_for_statement(top_level_number, state.block_lives)
+    dom_dict = CompilerTools.CFGs.compute_dominators(data.lives.cfg)
+    bb_index = CompilerTools.LivenessAnalysis.find_bb_for_statement(top_level_number, data.lives)
     @dprintln(3, "get_available_variables dom_dict ", dom_dict, " bb_index ", bb_index)
     available_variables = Set{LHSVar}()
+    available_variables = union(data.saved_available_variables, available_variables)
     # input parameters are also available
-    available_variables = union(getInputParametersAsLHSVar(state.LambdaVarInfo), available_variables)
+    available_variables = union(getInputParametersAsLHSVar(data.linfo), available_variables)
     if bb_index==nothing
         return available_variables
     end
@@ -1473,10 +1644,10 @@ function get_available_variables(top_level_number, state)
     # find def variables for dominant blocks except current one
     for i in dom_bbs
         if i==bb_index continue end
-        bb = CompilerTools.LivenessAnalysis.getBasicBlockFromBlockNumber(i, state.block_lives)
+        bb = CompilerTools.LivenessAnalysis.getBasicBlockFromBlockNumber(i, data.lives)
         available_variables = union(bb.def, available_variables)
     end
-    bb = CompilerTools.LivenessAnalysis.getBasicBlockFromBlockNumber(bb_index, state.block_lives)
+    bb = CompilerTools.LivenessAnalysis.getBasicBlockFromBlockNumber(bb_index, data.lives)
     # find def variables for previous statements of same block
     for stmts in bb.statements
       if stmts.tls.index < top_level_number
@@ -1505,12 +1676,72 @@ function get_array_correlation_symbols(arr::LHSVar, state)
     return out
 end
 
-function replaceConstArraysizes(node :: ANY, state :: expr_state, top_level_number :: Int64, is_top_level :: Bool, read :: Bool)
+function replaceConstArraysizes(node::ANY, state::ReplaceConstArraysizesData, top_level_number::Int64, is_top_level::Bool, read::Bool)
     @dprintln(4,"replaceConstArraysizes starting top_level_number = ", top_level_number, " is_top = ", is_top_level)
     @dprintln(4,"replaceConstArraysizes node = ", node, " type = ", typeof(node))
     @dprintln(4,"Not an expr node.")
     return CompilerTools.AstWalker.ASTWALK_RECURSE
 end
+
+"""
+Replace arraysize calls in range correlations like 1:arraysize() which are generated
+from expressions like A[:,i] (kmeans_gen case).
+"""
+function replaceConstArraysizesRangeCorrelations(range_correlations::Dict{Array{DimensionSelector,1},Int}, state::ReplaceConstArraysizesData)
+    @dprintln(3,"replaceConstArraysizesRangeCorrelations ", keys(range_correlations))
+    for a in keys(range_correlations)
+        for r in a
+            @dprintln(3,"replaceConstArraysizesRangeCorrelations ", r)
+            replaceConstArraysizesRange(r, state)
+        end
+    end
+    nothing
+end
+
+function replaceConstArraysizesRange(r::RangeData, state::ReplaceConstArraysizesData)
+    @dprintln(3,"replaceConstArraysizesRangeCorrelations ", r.exprs.last_val)
+    r.exprs.last_val = replaceConstArraysizesRangeNode(r.exprs.last_val, state)
+end
+
+replaceConstArraysizesRange(r::ANY, state::ReplaceConstArraysizesData) = nothing
+
+function replaceConstArraysizesRangeNode(node::Expr, state::ReplaceConstArraysizesData)
+    @dprintln(3,"replaceConstArraysizesRangeCorrelations RangeExprs last_val ", node)
+    if !isCall(node) return node end
+    func = getCallFunction(node)
+    if !isBaseFunc(func,:arraysize) && !isBaseFunc(func,:arraylen)
+        return node
+    end
+    @dprintln(3,"replaceConstArraysizesRangeCorrelations size call found", node)
+    args = getCallArguments(node)
+    arr = toLHSVar(args[1])
+    # get array sizes if available, there could be multiple
+    size_syms_arr = get_array_correlation_symbols(arr, state)
+    available_variables = getInputParametersAsLHSVar(state.linfo)
+    if isBaseFunc(func, :arraysize)
+        dim_ind::Int = args[2] # dimension number
+        for size_syms in size_syms_arr
+            res = size_syms[dim_ind]
+            if isa(res,Int) || in(res,available_variables)
+                @dprintln(3, "arraysize() in range replaced: ", node," res ", res)
+                return res
+            end
+        end
+    end
+
+    if isBaseFunc(func, :arraylen)
+        for size_syms in size_syms_arr
+            if mapreduce(x-> isa(x,Int) || in(x,available_variables), &, size_syms)
+                res = mk_mult_int_expr(size_syms)
+                @dprintln(3, "arraylen() in range replaced: ", node," res ", res)
+                return res
+            end
+        end
+    end
+    return node
+end
+
+replaceConstArraysizesRangeNode(node::ANY, state::ReplaceConstArraysizesData) = node
 
 """
 Implements one of the main ParallelIR passes to remove assertEqShape AST nodes from the body if they are statically known to be in the same equivalence class.

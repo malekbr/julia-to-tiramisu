@@ -63,6 +63,13 @@ type LambdaGlobalData
     worklist::Array{Any, 1}
     jtypes::Dict{Type, AbstractString}
     ompdepth::Int64
+    head_loop_set::Set{Int}
+    back_loop_set::Set{Int}
+    exit_loop_set::Set{Int}
+    all_loop_exits::Set{Int}
+    follow_set::Dict{Int,Int}
+    cond_jump_targets::Set{Int}
+
     function LambdaGlobalData()
         _j = Dict(
             Int8    =>  "int8_t",
@@ -84,7 +91,7 @@ type LambdaGlobalData
     )
 
         #new(ASTDispatcher(), [], Dict(), Dict(), [], [])
-        new([], Dict(), Dict(), [], Dict(), Dict(), [], [], _j, 0)
+        new([], Dict(), Dict(), [], Dict(), Dict(), [], [], _j, 0, Set{Int}(), Set{Int}(), Set{Int}(), Set{Int}(), Dict{Int,Int}(), Set{Int}())
     end
 end
 
@@ -99,9 +106,6 @@ end
 const VECDEFAULT = 0
 const VECDISABLE = 1
 const VECFORCE = 2
-const USE_ICC = 0
-const USE_GCC = 1
-const USE_MINGW = 2
 USE_OMP = 1
 CGEN_RAW_ARRAY_MODE = false
 
@@ -128,28 +132,14 @@ end
 # Globals
 inEntryPoint = false
 lstate = nothing
-backend_compiler = USE_ICC
-use_bcpp = 0
 USE_HDF5 = 0
-package_root = getPackageRoot()
-mkl_lib = ""
-openblas_lib = ""
-sys_blas = 0
 NERSC = 0
 USE_DAAL = 0
-#config file overrides backend_compiler variable
-if isfile("$package_root/deps/generated/config.jl")
-  include("$package_root/deps/generated/config.jl")
-end
 
 if haskey(ENV, "CGEN_NO_OMP") && ENV["CGEN_NO_OMP"]=="1"
     global USE_OMP = 0
-else # on osx, use OpenMP only when ICC is used since GCC/Clang doesn't support it
-    if Compat.is_apple()
-        global USE_OMP = USE_ICC
-    else
-        global USE_OMP = 1
-    end
+else # use setting from config file
+    global USE_OMP = ParallelAccelerator.openmp_supported
 end
 
 if isDistributedMode() #&& NERSC==0
@@ -217,6 +207,7 @@ end
 # Reset and reuse the LambdaGlobalData object across function
 # frames
 function resetLambdaState(l::LambdaGlobalData)
+    @dprintln(3, "resetLambdaState")
     empty!(l.ompprivatelist)
     empty!(l.globalConstants)
     empty!(l.globalUDTs)
@@ -225,6 +216,12 @@ function resetLambdaState(l::LambdaGlobalData)
     empty!(l.worklist)
     inEntryPoint = false
     l.ompdepth = 0
+    empty!(l.head_loop_set)
+    empty!(l.back_loop_set)
+    empty!(l.exit_loop_set)
+    empty!(l.all_loop_exits)
+    empty!(l.follow_set)
+    empty!(l.cond_jump_targets)
 end
 
 
@@ -244,28 +241,29 @@ _builtins = ["getindex", "getindex!", "setindex", "setindex!", "arrayref", "top"
             "Float32", "Float64",
             "Int8", "Int16", "Int32", "Int64",
             "UInt8", "UInt16", "UInt32", "UInt64",
-            "convert", "unsafe_convert", "setfield!"
+            "convert", "unsafe_convert", "setfield!", "string"
 ]
 
 # Intrinsics
 _Intrinsics = [
         "===",
         "box", "unbox",
+        "bitcast",
         #arithmetic
         "neg_int", "add_int", "sub_int", "mul_int", "sle_int", "ule_int",
         "xor_int", "and_int", "or_int", "ne_int", "eq_int",
         "sdiv_int", "udiv_int", "srem_int", "urem_int", "smod_int", "ctlz_int",
         "neg_float", "add_float", "sub_float", "mul_float", "div_float",
         "neg_float_fast", "add_float_fast", "sub_float_fast", "mul_float_fast", "div_float_fast",
-        "rem_float", "sqrt_llvm", "fma_float", "muladd_float",
-        "le_float", "ne_float", "eq_float", "copysign_float",
+        "rem_float", "sqrt_llvm", "sqrt_llvm_fast", "fma_float", "muladd_float",
+        "le_float", "le_float_fast", "ne_float", "ne_float_fast", "eq_float", "eq_float_fast", "copysign_float",
         "fptoui", "fptosi", "uitofp", "sitofp", "not_int",
-        "nan_dom_err", "lt_float", "slt_int", "ult_int", "abs_float", "select_value",
+        "nan_dom_err", "lt_float", "lt_float_fast", "slt_int", "ult_int", "abs_float", "select_value",
         "fptrunc", "fpext", "trunc_llvm", "floor_llvm", "rint_llvm",
         "trunc", "ceil_llvm", "ceil", "pow", "powf", "lshr_int",
         "checked_ssub", "checked_ssub_int", "checked_sadd", "checked_sadd_int", "checked_srem_int",
         "checked_smul", "checked_sdiv_int", "checked_udiv_int", "checked_urem_int", "flipsign_int", "check_top_bit", "shl_int", "ctpop_int",
-        "checked_trunc_uint", "checked_trunc_sint", "checked_fptosi", "powi_llvm",
+        "checked_trunc_uint", "checked_trunc_sint", "checked_fptosi", "powi_llvm", "llvm.powi.f64", "llvm.powf.f64",
         "ashr_int", "lshr_int", "shl_int",
         "cttz_int",
         "zext_int", "sext_int"
@@ -411,6 +409,59 @@ function from_includes()
 
     s *= "unsigned main_count = 0;\n"
 
+    if VERSION >= v"0.6.0-pre"
+        s *= "
+              template <typename R, typename T, typename U>
+              R checked_sadd_int(T x, U y) {
+                  R ret;
+                  ret.f0 = x + y;
+                  if ((ret.f0 > x) != (y > 0)) ret.f1 = true;
+                  else ret.f1 = false;
+                  return ret;
+              }\n 
+              template <typename R, typename T, typename U>
+              R checked_ssub_int(T x, U y) {
+                  R ret;
+                  ret.f0 = x - y;
+                  if ((ret.f0 < x) != (y > 0)) ret.f1 = true;
+                  else ret.f1 = false;
+                  return ret;
+              }\n
+              template <typename R, typename T, typename U>
+              R checked_smul_int(T x, U y) {
+                  R ret;
+                  ret.f0 = x * y;
+                  if ((x != 0) && (ret.f0 / x != b)) ret.f1 = true;
+                  else ret.f1 = false;
+                  return ret;
+              }\n
+              template <typename R, typename T, typename U>
+              R checked_uadd_int(T x, U y) {
+                  R ret;
+                  ret.f0 = x + y;
+                  if ((ret.f0 < x) || (ret.f0 < y)) ret.f1 = true;
+                  else ret.f1 = false;
+                  return ret;
+              }\n
+              template <typename R, typename T, typename U>
+              R checked_usub_int(T x, U y) {
+                  R ret;
+                  ret.f0 = x - y;
+                  if (y > x) ret.f1 = true;
+                  else ret.f1 = false;
+                  return ret;
+              }\n
+              template <typename R, typename T, typename U>
+              R checked_umul_int(T x, U y) {
+                  R ret;
+                  ret.f0 = x * y;
+                  if ((x != 0) && (ret.f0 / x != b)) ret.f1 = true;
+                  else ret.f1 = false;
+                  return ret;
+              }\n
+              "
+    end
+             
     return s
 end
 
@@ -467,7 +518,7 @@ end
 
 # Generic declaration emitter for non-primitive Julia DataTypes
 function from_decl(k::DataType, linfo)
-    if is(k, UnitRange{Int64})
+    if (k === UnitRange{Int64})
         if haskey(lstate.globalUDTs, k)
             lstate.globalUDTs[k] = 0
         end
@@ -534,13 +585,215 @@ end
 
 function isCompositeType(t::Type)
     # TODO: Expand this to real UDTs
-    b = (t<:Tuple) || is(t, UnitRange{Int64}) || is(t, StepRange{Int64, Int64})
+    b = (t<:Tuple) || (t === UnitRange{Int64}) || (t === StepRange{Int64, Int64})
     b
 end
 
 function from_lambda(ast)
     linfo, body = CompilerTools.LambdaHandling.lambdaToLambdaVarInfo(ast)
     from_lambda(linfo, body)
+end
+
+type Conditional
+    head :: Int
+    follow :: Int
+    hasElse :: Bool
+end
+
+function hasElse(head, follow, bbs)
+    succs = [x.label for x in bbs[head].succs]
+    !in(follow, succs)
+end
+
+function addConditional(conditionals, head, follow, bbs, follow_set, cond_jump_targets)
+    with_else = hasElse(head, follow, bbs)
+    push!(conditionals, Conditional(head, follow, with_else))
+    if !haskey(follow_set, follow)
+        follow_set[follow] = 0
+    end
+    follow_set[follow] = follow_set[follow] + 1
+    union!(cond_jump_targets, Set{Int}([x.label for x in bbs[head].succs]))
+end
+
+function getLoopInfo(body)
+    empty!(lstate.head_loop_set)
+    empty!(lstate.back_loop_set)
+    empty!(lstate.exit_loop_set)
+    empty!(lstate.all_loop_exits)
+    empty!(lstate.follow_set)
+    empty!(lstate.cond_jump_targets)
+
+    if !recreateLoops
+        return
+    end
+
+    @dprintln(3, "getLoopInfo body = ", body)
+    cfg = CompilerTools.CFGs.from_lambda(body)
+
+#    intervals = CompilerTools.CFGs.computeIntervals(cfg)
+#    @dprintln(3, "intervals = ", intervals)
+
+    blockCategories = [Set{Int}() for x = 1:3]
+    for bbentry in cfg.basic_blocks
+        push!(blockCategories[CompilerTools.CFGs.classifyBlock(bbentry[2])], bbentry[1])
+    end
+    @dprintln(3, "blockCategories = ", blockCategories)
+    unaccounted = deepcopy(blockCategories[CompilerTools.CFGs.BLOCK_GOTOIFNOT])
+
+    inv_dom = CompilerTools.CFGs.compute_inverse_dominators(cfg)
+    @dprintln(3, "inverse dominators = ", inv_dom)
+
+    loop_info = CompilerTools.Loops.compute_dom_loops(cfg)
+    im_doms = CompilerTools.CFGs.compute_immediate_dominators(loop_info.dom_dict)
+    @dprintln(3, "immediate_dominators = ", im_doms)
+    @dprintln(3, "dominators = ", loop_info.dom_dict)
+
+    for li in loop_info.loops
+        @dprintln(3, "Loop Info = ", li)
+        head_bb = cfg.basic_blocks[li.head]
+        back_bb = cfg.basic_blocks[li.back_edge]
+        union!(lstate.all_loop_exits, li.exits)
+        unaccounted = setdiff(unaccounted, li.blocks_that_exit)
+
+        if length(li.exits) > 1
+            @dprintln(3, "Couldn't recreate loop since loop has more than one exit block.")
+            continue
+        end
+
+        exit_bb = cfg.basic_blocks[first(li.exits)]
+
+        # If the exit node has more than one predecessor then we can't eliminate the label.
+        if length(exit_bb.preds) > 1
+            @dprintln(3, "Couldn't recreate loop since exit block has more than one predecessor.")
+            continue
+        end
+        # If the head node has a non-back edge predecessor that doesn't fallthrough to head then we can't eliminate the label.
+        okay = true
+        for hp in head_bb.preds
+            if hp == back_bb
+                continue
+            end
+            if hp.fallthrough_succ == nothing
+                okay = false
+                break
+            end
+        end
+        if !okay
+            @dprintln(3, "Couldn't recreate loop since head non-back edge predecessor doesn't fallthrough to head.")
+            continue
+        end
+
+        @dprintln(3, "Adding loop to set to recreate.")
+        push!(lstate.head_loop_set, li.head)
+        push!(lstate.back_loop_set, li.back_edge)
+        push!(lstate.exit_loop_set, exit_bb.label)
+    end
+    @dprintln(3, "Unaccounted gotoifnot blocks = ", unaccounted)
+
+    unresolved = Set{Int}()
+    conditionals = Conditional[]
+    follow_set = Dict{Int,Int}()
+    cond_jump_targets = Set{Int}()
+
+    # For blocks in reverse order.
+    for i = length(cfg.depth_first_numbering):-1:1
+        to_check = cfg.depth_first_numbering[i]
+        @dprintln(3, "2-way conditional processing ", to_check, " unaccounted = ", unaccounted)
+        # If this block is a gotoifnot node that isn't part of a loop then it is a conditional.
+        if in(to_check, unaccounted)
+            @dprintln(3, "2-way conditional in unaccounted")
+            found = false
+            best_follow = CompilerTools.CFGs.CFG_EXIT_BLOCK
+            # Scan the blocks in reverse order.
+            # If we find a block that inverse dominates the unaccounted (to_check) block then we
+            # have a potential follow block.  There may be other lesser blocks that also inverse
+            # dominate so we keep going until the block we are working with is the same as to_check.
+            for j = length(cfg.depth_first_numbering):-1:1
+                potential_follow = cfg.depth_first_numbering[j]
+                @dprintln(3, "2-way conditional checking potential follow ", potential_follow)
+                if potential_follow == to_check
+                    @dprintln(5,"Found follow == to_check.")
+                    break
+                end
+                if in(potential_follow, inv_dom[to_check])
+                    @dprintln(3,"Found new best_follow.")
+                    best_follow = potential_follow
+                end
+            end
+            # If we found the closest block that inverse dominates to_check then add this combination as a conditional.
+            # to_check is the conditional head and best_follow is the block that follows the conditional.
+            if best_follow != CompilerTools.CFGs.CFG_EXIT_BLOCK
+                @dprintln(3, "2-way conditional found follow.  head = ", to_check, " follow = ", best_follow)
+                addConditional(conditionals, to_check, best_follow, cfg.basic_blocks, follow_set, cond_jump_targets)
+                found = true
+if false
+                for one_unresolved in unresolved
+                    if one_unresolved != best_follow 
+                        if in(to_check, loop_info.dom_dict[one_unresolved])
+                            @dprintln(3, "2-way conditional processing unresolved.  head = ", one_unresolved, " follow = ", best_follow)
+                            addConditional(conditionals, one_unresolved, best_follow, cfg.basic_blocks, follow_set, cond_jump_targets)
+                        else
+                            @dprintln(3, "2-way conditional skipping unresolved since to_check doesn't dominate unresolved.")
+                        end
+                    else
+                        @dprintln(3, "2-way conditional skipping unresolved since head and follow are equal.")
+                    end
+                end
+end
+                unresolved = Set{Int}()
+            end
+            if !found
+                @dprintln(3, "2-way conditional couldn't find follow....adding unresolved ", to_check)
+                push!(unresolved, to_check)
+            end
+        end
+    end
+
+    @dprintln(3, "conditionals = ", conditionals)
+    @dprintln(3, "follow_set = ", follow_set)
+    @dprintln(3, "cond_jump_targets = ", cond_jump_targets)
+
+    lstate.follow_set = follow_set
+    lstate.cond_jump_targets = cond_jump_targets
+
+    @dprintln(3, "head_loop_set = ", lstate.head_loop_set)
+    @dprintln(3, "back_loop_set = ", lstate.back_loop_set)
+    @dprintln(3, "exit_loop_set = ", lstate.exit_loop_set)
+    @dprintln(3, "all_loop_exits = ", lstate.all_loop_exits)
+    @dprintln(3, "follow_set = ", lstate.follow_set)
+    @dprintln(3, "cond_jump_targets = ", lstate.cond_jump_targets)
+end
+
+type CGen_boolean_and
+    lhs
+    rhs
+end
+
+function mergeGotoIfNot(body :: Expr)
+    assert(body.head == :body)
+    new_body = []
+
+    @dprintln(3, "Before mergeGotoIfNot. ", body)
+    i = 1
+    while i <= length(body.args) 
+        if isa(body.args[i], Expr) && body.args[i].head == :gotoifnot
+            labelId = body.args[i].args[2]
+            while ((i+1) <= length(body.args)) && 
+                  isa(body.args[i+1], Expr) && 
+                  body.args[i+1].head == :gotoifnot && 
+                  body.args[i+1].args[2] == labelId
+                body.args[i+1].args[1] = CGen_boolean_and(body.args[i].args[1], body.args[i+1].args[1])
+                i += 1
+            end
+        end
+        push!(new_body, body.args[i])
+        i += 1
+    end
+
+    body.args = new_body
+    @dprintln(3, "After mergeGotoIfNot. ", body)
+
+    return body
 end
 
 function from_lambda(linfo :: LambdaVarInfo, body)
@@ -566,6 +819,12 @@ function from_lambda(linfo :: LambdaVarInfo, body)
             push!(lstate.globalUDTsOrder, t)
         end
     end
+
+    if recreateConds
+        body = mergeGotoIfNot(body)
+    end
+
+    getLoopInfo(body)
 
     bod = from_expr(body, linfo)
     @dprintln(3,"lambda params = ", params)
@@ -654,11 +913,12 @@ function from_assignment(args::Array{Any,1}, linfo)
 
     @dprintln(3,"external pattern match returned nothing")
 
+    # 0.4 legacy code not needed anymore
     # hack to convert triangular matrix output of cholesky
-    chol_match = pattern_match_assignment_chol(lhs, rhs, linfo)
-    if chol_match!=""
-        return chol_match
-    end
+    #chol_match = pattern_match_assignment_chol(lhs, rhs, linfo)
+    #if chol_match!=""
+    #    return chol_match
+    #end
 
     match_hvcat = from_assignment_match_hvcat(lhs, rhs, linfo)
     if match_hvcat!=""
@@ -711,9 +971,9 @@ function from_assignment(args::Array{Any,1}, linfo)
         end
         # Try to refine type for certain stmts with a call in the rhs
         # that doesn't have a type
-        if typeAvailable(rhs) && is(rhs.typ, Any) &&
-        hasfield(rhs, :head) && (is(rhs.head, :call) || is(rhs.head, :call1))
-            m, f, t = resolveCallTarget(rhs.args,linfo)
+        if typeAvailable(rhs) && (rhs.typ === Any) &&
+        hasfield(rhs, :head) && ((rhs.head === :call) || (rhs.head === :call1))
+            m, f, t = resolveCallTarget(rhs.args,linfo, rhs.typ)
             f = string(f)
             if f == "fpext"
                 @dprintln(3,"Args: ", rhs.args, " type = ", typeof(rhs.args[2]))
@@ -987,7 +1247,67 @@ function from_arraysize(arr, dim::Int, linfo)
 end
 
 
-function from_ccall(args, linfo)
+function from_foreigncall(args, linfo, call_ret_typ)
+    @dprintln(3,"foreigncall args:")
+    @dprintln(3,"target tuple: ", args[1], " - ", typeof(args[1]))
+    @dprintln(3,"return type: ", args[2])
+    @dprintln(3,"input types tuple: ", args[3])
+    long_inputs = args[4:end]
+    @dprintln(3,"inputs tuple: ", long_inputs)
+
+#    short_inputs = []
+#    for i = 1:length(long_inputs)
+#        if i%2 == 1
+#            push!(short_inputs, long_inputs[i])
+#        end
+#    end
+#    @dprintln(3,"short_inputs: ", short_inputs)
+
+    for i in 1:length(args)
+        @dprintln(3,"arg ", i, " = ", args[i])
+    end
+    @dprintln(3,"End of foreigncall args")
+    fun = args[1]
+    if isInlineable(fun, args, linfo)
+        @dprintln(3,"isInlineable")
+        return from_inlineable(fun, args, linfo, call_ret_typ)
+    end
+
+    if isa(fun, QuoteNode)
+        s = from_symbol(fun, linfo)
+#    elseif isa(fun, Expr) && ((fun.head === :call1) || (fun.head === :call))
+#        s = canonicalize(string(fun.args[2]))
+#        @dprintln(3,"ccall target: ", s)
+    elseif isa(fun, Tuple) && length(fun) == 2
+        s = canonicalize(string(fun[1]))
+        @dprintln(3,"ccall target: ", s)
+    else
+        throw("Invalid ccall format...")
+    end
+    s *= "("
+#    numInputs = length(args[3].args)-1
+    argsStart = 4
+    argsEnd = length(args)
+    if contains(s, "cblas") && contains(s, "gemm")
+        if mkl_lib!=""
+            s *= "(CBLAS_LAYOUT) $(from_expr(args[4], linfo)), "
+        else
+            s *= "(CBLAS_ORDER) $(from_expr(args[4], linfo)), "
+        end
+        s *= "(CBLAS_TRANSPOSE) $(from_expr(args[6], linfo)), "
+        s *= "(CBLAS_TRANSPOSE) $(from_expr(args[8], linfo)), "
+        argsStart = 10
+    end
+    to_fold = args[argsStart:2:end]
+    if length(to_fold) > 0
+        s *= mapfoldl(x->from_expr(x,linfo), (a, b)-> "$a, $b", to_fold)
+    end
+    s *= ")"
+    @dprintln(3,"from_foreignccall: ", s)
+    s
+end
+
+function from_ccall(args, linfo, call_ret_typ)
     @dprintln(3,"ccall args:")
     @dprintln(3,"target tuple: ", args[1], " - ", typeof(args[1]))
     @dprintln(3,"return type: ", args[2])
@@ -999,19 +1319,22 @@ function from_ccall(args, linfo)
     @dprintln(3,"End of ccall args")
     fun = args[1]
     if isInlineable(fun, args, linfo)
-        return from_inlineable(fun, args, linfo)
+        return from_inlineable(fun, args, linfo, call_ret_typ)
     end
 
     if isa(fun, QuoteNode)
         s = from_symbol(fun, linfo)
-    elseif isa(fun, Expr) && (is(fun.head, :call1) || is(fun.head, :call))
+    elseif isa(fun, Expr) && ((fun.head === :call1) || (fun.head === :call))
         s = canonicalize(string(fun.args[2]))
+        @dprintln(3,"ccall target: ", s)
+    elseif isa(fun, Tuple) && length(fun) == 2
+        s = canonicalize(string(fun[1]))
         @dprintln(3,"ccall target: ", s)
     else
         throw("Invalid ccall format...")
     end
     s *= "("
-    numInputs = length(args[3].args)-1
+#    numInputs = length(args[3].args)-1
     argsStart = 4
     argsEnd = length(args)
     if contains(s, "cblas") && contains(s, "gemm")
@@ -1045,7 +1368,7 @@ function from_arrayset(args, linfo)
 end
 
 function istupletyp(typ)
-    isa(typ, DataType) && is(typ.name, Tuple.name)
+    isa(typ, DataType) && (typ.name === Tuple.name)
 end
 
 function from_setfield!(args, linfo)
@@ -1230,8 +1553,14 @@ function from_raw_pointer(args, linfo)
     end
 end
 
-function from_builtins(f, args, linfo)
+function from_string(args, linfo)
+    @dprintln(3,"from_string")
+    "BaseString(" * mapfoldl(x -> from_expr(x, linfo), (a,b) -> a * "," * b, args) * ")"
+end
+
+function from_builtins(f, args, linfo, call_ret_type)
     tgt = string(f)
+    @dprintln(3,"from_builtins tgt = ", tgt)
     if tgt == "getindex" || tgt == "getindex!"
         return from_getindex(args, linfo)
     elseif tgt == "setindex" || tgt == "setindex!"
@@ -1252,7 +1581,7 @@ function from_builtins(f, args, linfo)
     elseif tgt == "arraysize"
         return from_arraysize(args, linfo)
     elseif tgt == "ccall"
-        return from_ccall(args, linfo)
+        return from_ccall(args, linfo, call_ret_type)
     elseif tgt == "arrayset"
         return from_arrayset(args, linfo)
     elseif tgt == ":jl_new_array" || tgt == ":jl_alloc_array_1d" || tgt == ":jl_alloc_array_2d" || tgt == ":jl_alloc_array_3d"
@@ -1292,6 +1621,8 @@ function from_builtins(f, args, linfo)
             cmp_op = "<"
         end
         return "(($arg_x $cmp_op $arg_y) ? ($arg_x) : ($arg_y))"
+    elseif tgt == "string"
+        return from_string(args, linfo)
     elseif isdefined(Base, f)
         fval = getfield(Base, f)
         if isa(fval, DataType)
@@ -1318,7 +1649,7 @@ function from_box(args, linfo)
     s
 end
 
-function from_intrinsic(f :: ANY, args, linfo)
+function from_intrinsic(f :: ANY, args, linfo, call_ret_typ)
     intr = string(f)
     @dprintln(3,"Intrinsic ", intr, ", args are ", args)
 
@@ -1348,12 +1679,32 @@ function from_intrinsic(f :: ANY, args, linfo)
         return "($(from_expr(args[1], linfo))) >> ($(from_expr(args[2], linfo)))"
     elseif intr == "shl_int"
         return "($(from_expr(args[1], linfo))) << ($(from_expr(args[2], linfo)))"
+    elseif intr == "bitcast"
+        return "(($(toCtype(args[1])))($(from_expr(args[2], linfo))))"
     elseif intr == "checked_ssub" || intr == "checked_ssub_int"
-        return "($(from_expr(args[1], linfo))) - ($(from_expr(args[2], linfo)))"
+        if VERSION >= v"0.6.0-pre"
+            return "checked_ssub_int<$(toCtype(call_ret_typ))>($(from_expr(args[1], linfo)), $(from_expr(args[2], linfo)))"
+        else
+            return "($(from_expr(args[1], linfo))) - ($(from_expr(args[2], linfo)))"
+        end
     elseif intr == "checked_sadd" || intr == "checked_sadd_int"
-        return "($(from_expr(args[1], linfo))) + ($(from_expr(args[2], linfo)))"
+        if VERSION >= v"0.6.0-pre"
+            return "checked_sadd_int<$(toCtype(call_ret_typ))>($(from_expr(args[1], linfo)), $(from_expr(args[2], linfo)))"
+        else
+            return "($(from_expr(args[1], linfo))) + ($(from_expr(args[2], linfo)))"
+        end
     elseif intr == "checked_smul"
-        return "($(from_expr(args[1], linfo))) * ($(from_expr(args[2], linfo)))"
+        if VERSION >= v"0.6.0-pre"
+            return "checked_smul_int<$(toCtype(call_ret_typ))>($(from_expr(args[1], linfo)), $(from_expr(args[2], linfo)))"
+        else
+            return "($(from_expr(args[1], linfo))) * ($(from_expr(args[2], linfo)))"
+        end
+    elseif intr == "checked_umul"
+        if VERSION >= v"0.6.0-pre"
+            return "checked_umul_int<$(toCtype(call_ret_typ))>($(from_expr(args[1], linfo)), $(from_expr(args[2], linfo)))"
+        else
+            return "($(from_expr(args[1], linfo))) * ($(from_expr(args[2], linfo)))"
+        end
     elseif intr == "zext_int"
         return "($(toCtype(args[1]))) ($(from_expr(args[2], linfo)))"
     elseif intr == "sext_int"
@@ -1397,19 +1748,19 @@ function from_intrinsic(f :: ANY, args, linfo)
         return "($(from_expr(args[1], linfo))) << ($(from_expr(args[2], linfo)))"
     elseif intr == "add_float" || intr == "add_float_fast"
         return "($(from_expr(args[1], linfo))) + ($(from_expr(args[2], linfo)))"
-    elseif intr == "lt_float"
+    elseif intr == "lt_float" || intr == "lt_float_fast"
         return "($(from_expr(args[1], linfo))) < ($(from_expr(args[2], linfo)))"
-    elseif intr == "eq_float" || intr == "eq_int"
+    elseif intr == "eq_float" || intr == "eq_int" || intr == "eq_float_fast"
         return "($(from_expr(args[1], linfo))) == ($(from_expr(args[2], linfo)))"
-    elseif intr == "ne_float" || intr == "ne_int"
+    elseif intr == "ne_float" || intr == "ne_int" || intr == "ne_float_fast"
         return "($(from_expr(args[1], linfo))) != ($(from_expr(args[2], linfo)))"
-    elseif intr == "le_float"
+    elseif intr == "le_float" || intr == "le_float_fast"
         return "($(from_expr(args[1], linfo))) <= ($(from_expr(args[2], linfo)))"
     elseif intr == "neg_float" || intr == "neg_float_fast"
         return "-($(from_expr(args[1], linfo)))"
     elseif intr == "abs_float"
         return "fabs(" * from_expr(args[1], linfo) * ")"
-    elseif intr == "sqrt_llvm"
+    elseif intr == "sqrt_llvm" || intr == "sqrt_llvm_fast"
         return "sqrt(" * from_expr(args[1], linfo) * ")"
     elseif intr == "sub_float" || intr == "sub_float_fast"
         return "($(from_expr(args[1], linfo))) - ($(from_expr(args[2], linfo)))"
@@ -1430,8 +1781,12 @@ function from_intrinsic(f :: ANY, args, linfo)
         return "(" * from_expr(args[1], linfo) * " == " * from_expr(args[2], linfo) * ")"
     elseif intr == "pow" || intr == "powi_llvm"
         return "pow(" * from_expr(args[1], linfo) * ", " * from_expr(args[2], linfo) * ")"
+    elseif intr == "llvm.powi.f64"
+        return "pow(" * from_expr(args[4], linfo) * ", " * from_expr(args[6], linfo) * ")"
     elseif intr == "powf" || intr == "powf_llvm"
         return "powf(" * from_expr(args[1], linfo) * ", " * from_expr(args[2], linfo) * ")"
+    elseif intr == "llvm.powf.f64"
+        return "powf(" * from_expr(args[4], linfo) * ", " * from_expr(args[6], linfo) * ")"
     elseif intr == "nan_dom_err"
         @dprintln(3,"nan_dom_err is: ")
         for i in 1:length(args)
@@ -1447,7 +1802,7 @@ function from_intrinsic(f :: ANY, args, linfo)
     end
 end
 
-function from_inlineable(f, args, linfo)
+function from_inlineable(f, args, linfo, call_ret_typ)
     @dprintln(3,"Checking if ", f, " can be inlined")
     @dprintln(3,"Args are: ", args)
 #=
@@ -1462,20 +1817,30 @@ function from_inlineable(f, args, linfo)
 =#
     s = string(f)
     if has(_primitive_builtins, s) || has(_builtins, s)
-        return from_builtins(f, args, linfo)
+        return from_builtins(f, args, linfo, call_ret_typ)
+    elseif isBaseFunc(f, :length) && length(args) > 0 && (isArrayType(lookupType(args[1], linfo)) || isStringType(lookupType(args[1], linfo)))
+        return "(" * from_expr(args[1], linfo) * ".ARRAYLEN())"
     elseif has(_Intrinsics, s)
-        return from_intrinsic(f, args, linfo)
+        return from_intrinsic(f, args, linfo, call_ret_typ)
     else
         throw("Unknown Operator or Method encountered: " * s)
     end
 end
 
 function isInlineable(f, args, linfo)
+    #@dprintln(3, "IsInlineable f = ", f, " type = ", typeof(f), " isBase = ", isBaseFunc(f, :length), " args = ", args)
+    #if isBaseFunc(f, :length) && length(args) > 0
+    #    t = lookupType(args[1], linfo)
+    #    @dprintln(3,"t = ", t, " type = ", typeof(t), " isArray = ", isArrayType(t))
+    #end
+
     #if has(_operators, string(f)) || has(_builtins, string(f)) || has(_Intrinsics, string(f))
     s = string(f)
     if has(_primitive_builtins, s) && length(args) > 0
         t = lookupType(args[1], linfo)
         isPrimitiveJuliaType(t)
+    elseif isBaseFunc(f, :length) && length(args) > 0 && (isArrayType(lookupType(args[1], linfo)) || isStringType(lookupType(args[1], linfo)))
+        true
     else
         has(_builtins, s) || has(_Intrinsics, s)
     end
@@ -1497,6 +1862,27 @@ function from_linenumbernode(ast, linfo)
 end
 
 function from_labelnode(ast, linfo)
+    if recreateLoops
+        if in(ast.label, lstate.exit_loop_set)
+            return ""
+        end
+        if in(ast.label, lstate.head_loop_set)
+            return "while (1) {"
+        end
+    end
+    if recreateConds
+        if haskey(lstate.follow_set, ast.label)
+            s = ""
+            for i = 1:lstate.follow_set[ast.label]
+                s *= "}\n"
+            end
+            return s
+        end
+        if in(ast.label, lstate.cond_jump_targets)
+            return ""
+        end
+    end
+
     "label" * string(ast.label) * " : "
 end
 
@@ -1525,23 +1911,23 @@ function isPendingCompilation(list, tgt, typs0)
     return false
 end
 
-function resolveCallTarget(ast::Array{Any, 1},linfo)
+function resolveCallTarget(ast::Array{Any, 1},linfo, call_ret_typ)
     # julia doesn't have GetfieldNode anymore
     #if isdefined(:GetfieldNode) && isa(args[1],GetfieldNode) && isa(args[1].value,Module)
     #   M = args[1].value; s = args[1].name; t = ""
 
     @dprintln(3,"Trying to resolve target from ast::Array{Any,1} with args: ", ast)
-    return resolveCallTarget(ast[1], ast[2:end],linfo)
+    return resolveCallTarget(ast[1], ast[2:end],linfo, call_ret_typ)
 end
 
 #case 0:
-function resolveCallTarget(f::Symbol, args::Array{Any, 1},linfo)
+function resolveCallTarget(f::Symbol, args::Array{Any, 1},linfo, call_ret_typ)
     M = ""
     t = ""
     s = ""
     if isInlineable(f, args, linfo)
-        return M, string(f), from_inlineable(f, args, linfo)
-    elseif is(f, :call)
+        return M, string(f), from_inlineable(f, args, linfo, call_ret_typ)
+    elseif (f === :call)
         #This means, we have a Base.call - if f is not a Function, this is translated to f(args)
         arglist = mapfoldl(x->from_expr(x,linfo), (a,b)->"$a, $b", args[2:end])
         if isa(args[1], DataType)
@@ -1553,11 +1939,11 @@ function resolveCallTarget(f::Symbol, args::Array{Any, 1},linfo)
     return M, s, t
 end
 
-function resolveCallTarget(f::Expr, args::Array{Any, 1},linfo)
+function resolveCallTarget(f::Expr, args::Array{Any, 1},linfo, call_ret_typ)
     M = ""
     t = ""
     s = ""
-    if is(f.head,:call) || is(f.head,:call1) # :call1 is gone in v0.4
+    if (f.head === :call) || (f.head === :call1) # :call1 is gone in v0.4
         if length(f.args) == 3 && isBaseFunc(f.args[1], :getfield) && isa(f.args[3],QuoteNode)
             s = f.args[3].value
             if isa(f.args[2],Module)
@@ -1571,11 +1957,19 @@ function resolveCallTarget(f::Expr, args::Array{Any, 1},linfo)
     return M, s, t
 end
 
-function resolveCallTarget(f, args::Array{Any, 1},linfo)
+function resolveCallTarget(f, args::Array{Any, 1},linfo, call_ret_typ)
     @dprintln(3,"Trying to resolve target from ", f, "::", typeof(f), " with args: ", args)
     M = ""
     t = ""
     s = ""
+
+    if isa(f, QuoteNode)
+        @dprintln(3,"Removing QuoteNode.")
+        M = Base
+        f = f.value
+        s = f
+    end
+
     #case 1:
     if isBaseFunc(f, :getfield) && isa(args[2], QuoteNode)
         @dprintln(3,"Case 1: args[2] is ", args[2])
@@ -1594,12 +1988,12 @@ function resolveCallTarget(f, args::Array{Any, 1},linfo)
         end
         @dprintln(3,"Case 1: Returning M = ", M, " s = ", s, " t = ", t)
     # the following appears to be dead code
-    # elseif isBaseFunc(f, :getfield) && hasfield(f, :head) && is(f.head, :call)
+    # elseif isBaseFunc(f, :getfield) && hasfield(f, :head) && (f.head === :call)
     #    @dprintln(3,"Case 2: calling")
     #    return resolveCallTarget(f,linfo)
     # case 3:
     elseif (isa(f, TopNode) || isa(f, GlobalRef)) && isInlineable(f.name, args, linfo)
-        t = from_inlineable(f.name, args,linfo)
+        t = from_inlineable(f.name, args,linfo, call_ret_typ)
         @dprintln(3,"Case 3: Returning M = ", M, " s = ", s, " t = ", t)
     end
     @dprintln(3,"In resolveCallTarget: Returning M = ", M, " s = ", s, " t = ", t)
@@ -1607,12 +2001,21 @@ function resolveCallTarget(f, args::Array{Any, 1},linfo)
 end
 
 function inSymbolTable(x::RHSVar, linfo)
+    @dprintln(3, "inSymbolTable RHSVar x = ", x)
     x = CompilerTools.LambdaHandling.lookupVariableName(x, linfo)
+    @dprintln(3, "inSymbolTable RHSVar x = ", x)
+    if !haskey(lstate.symboltable, x)
+        @dprintln(3, "symboltable = ", lstate.symboltable)
+    end
     haskey(lstate.symboltable, x)
 end
 
 
-inSymbolTable(x, linfo) = haskey(lstate.symboltable, x)
+#inSymbolTable(x, linfo) = haskey(lstate.symboltable, x)
+function inSymbolTable(x, linfo) 
+    @dprintln(3, "inSymbolTable x = ", x, " ", typeof(x))
+    haskey(lstate.symboltable, x)
+end
 
 function lookupSymbolType(x, linfo)
     x = CompilerTools.LambdaHandling.lookupVariableName(x, linfo)
@@ -1655,7 +2058,7 @@ function setFunctionCompiled(funStr, argTyps)
     push!(lstate.compiledfunctions, (funStr, typs))
 end
 
-function from_call(ast::Array{Any, 1},linfo)
+function from_call(ast::Array{Any, 1},linfo, call_ret_typ)
 
     pat_out = external_pattern_match_call.func(ast,linfo)
     if pat_out != ""
@@ -1674,7 +2077,7 @@ function from_call(ast::Array{Any, 1},linfo)
         @dprintln(3,"Arg ", i, " = ", ast[i], " type = ", typeof(ast[i]))
     end
     # Try and find the target of the call
-    mod, fun, t = resolveCallTarget(ast,linfo)
+    mod, fun, t = resolveCallTarget(ast,linfo, call_ret_typ)
 
     # resolveCallTarget will eagerly try to translate the call
     # if it can. If it does, then we are done.
@@ -1693,14 +2096,14 @@ function from_call(ast::Array{Any, 1},linfo)
 
     if isInlineable(fun, args, linfo)
         @dprintln(3,"Doing with inlining ", fun, "(", args, ")")
-        fs = from_inlineable(fun, args,linfo)
+        fs = from_inlineable(fun, args, linfo, call_ret_typ)
         return fs
     end
     @dprintln(3,"Not inlinable")
     if isa(mod, Module)
-        funStr = "_" * from_expr(GlobalRef(mod, fun),linfo)
+        funStr = "_" * from_expr(GlobalRef(mod, fun), linfo)
     else
-        funStr = "_" * from_expr(fun,linfo)
+        funStr = "_" * from_expr(fun, linfo)
     end
 
     if isBaseFunc(fun, :println) || isBaseFunc(fun, :print)
@@ -1721,7 +2124,7 @@ function from_call(ast::Array{Any, 1},linfo)
     map((i)->@dprintln(3,i), lstate.compiledfunctions)
     argTyps = []
     for a in 1:length(args)
-        @dprintln(4, "a = ", a, " args[a] = ", args[a])
+        @dprintln(3, "a = ", a, " args[a] = ", args[a], " type = ", typeof(args[a]))
         s *= from_expr(args[a],linfo) * (a < length(args) ? "," : "")
         #if !skipCompilation
             # Attempt to find type
@@ -1734,6 +2137,7 @@ function from_call(ast::Array{Any, 1},linfo)
             elseif inSymbolTable(args[a], linfo)
                 push!(argTyps, lookupSymbolType(args[a], linfo))
             else
+                @dprintln(3, "linfo = ", linfo)
                 throw(string("Could not determine type for arg ", a, " to call ", mod, ".", fun, " with name ", args[a]))
             end
         #end
@@ -1813,7 +2217,13 @@ function from_gotonode(ast, linfo)
     if isa(exp, Expr) || isa(exp, RHSVar)
         s *= "if (!(" * from_expr(exp,linfo) * ")) "
     end
-    s *= "goto " * "label" * string(labelId)
+    if recreateLoops && in(labelId, lstate.head_loop_set)
+        s *= "}\n"
+    elseif recreateConds && haskey(lstate.follow_set, labelId)
+        s *= "}\nelse {"
+    else
+        s *= "goto " * "label" * string(labelId)
+    end
     s
 end
 
@@ -1822,9 +2232,15 @@ function from_gotoifnot(args,linfo)
     labelId = args[2]
     s = ""
     @dprintln(3,"Compiling gotoifnot: ", exp, " ", typeof(exp))
-    if isa(exp, Expr) || isa(exp, RHSVar)
-        s *= "if (!(" * from_expr(exp,linfo) * ")) "
-        s *= "goto " * "label" * string(labelId)
+    if isa(exp, Expr) || isa(exp, RHSVar) || isa(exp, CGen_boolean_and)
+        if recreateLoops && in(labelId, lstate.exit_loop_set)
+            s *= "if (!(" * from_expr(exp,linfo) * ")) break"
+        elseif recreateConds && in(labelId, lstate.cond_jump_targets)
+            s *= "if (" * from_expr(exp,linfo) * ") {"
+        else
+            s *= "if (!(" * from_expr(exp,linfo) * ")) "
+            s *= "goto " * "label" * string(labelId)
+        end
     elseif exp == true
     elseif exp == false
         s *= "goto " * "label" * string(labelId)
@@ -1914,6 +2330,7 @@ function from_parforend(args,linfo)
     rds = parfor.reductions
     parallel_reduction = USE_OMP==1 && lstate.ompdepth <= 1 #&& any(Bool[(isa(a->reductionFunc, Function) || isa(a->reductionVarInit, Function)) for a in rds])
     if parallel_reduction && length(rds) > 0
+        @dprintln(3,"from_parforend: parallel_reduction")
         nthreadsvar = "_num_threads"
         rdsepilog = "for (unsigned i = 0; i < $nthreadsvar; i++) {\n"
         rdscleanup = ""
@@ -1921,12 +2338,18 @@ function from_parforend(args,linfo)
             rdv = rd.reductionVar
             rdvt = getSymType(rdv, linfo)
             rdvtyp = toCtype(rdvt)
+            @dprintln(3,"from_parforend: rdv = ", rdv, " rdvt = ", rdvt, " rdvtyp = ", rdvtyp, " func = ", rd.reductionFunc)
             rdvar = from_expr(rdv,linfo)
+            @dprintln(3,"from_parforend: rdvar = ", rdvar)
             # this is now handled either in pre_statements, or by user (in the case of explicit parfor loop).
             #rdsinit *= from_reductionVarInit(rd.reductionVarInit, rdv,linfo)
             rdvar_i = addLocalVariable(gensym(string(rdvar, "_i")), rdvt, 0, linfo)
+            setSymbolType(rdvar_i, rdvt, linfo)
+            @dprintln(3,"from_parforend: rdvar_i = ", rdvar_i)
             rdsepilog *= "$rdvtyp &" * from_expr(rdvar_i, linfo) * " = $(rdvar)_vec[i];\n"
+            @dprintln(3,"from_parforend: rdsepilog = ", rdsepilog);
             rdsepilog *= from_reductionFunc(rd.reductionFunc, rdv, rdvar_i,linfo) * ";\n"
+            @dprintln(3,"from_parforend: after reductionFunc rdsepilog = ", rdsepilog);
             if isPrimitiveJuliaType(rdvt)
                 rdscleanup *= "free($(rdvar)_vec);\n";
             end
@@ -1982,6 +2405,7 @@ function from_reductionFunc(reductionFunc :: Symbol, a, b, linfo)
 end
 
 function from_reductionFunc(reductionFunc :: ParallelIR.DelayedFunc, a, b, linfo)
+    @dprintln(3, "from_reductionFunc for DelayedFunc")
     from_exprs(ParallelIR.callDelayedFuncWith(reductionFunc, a, b), linfo)
 end
 
@@ -2109,7 +2533,8 @@ function from_parforstart(args, linfo)
         rdvtyp = toCtype(rdvt)
         rdvar = from_expr(rdv, linfo)
         rdv_tmp = gensym(rdvar)
-        addLocalVariable(rdv_tmp, rdvt, 0, linfo)
+        advout = addLocalVariable(rdv_tmp, rdvt, 0, linfo)
+        setSymbolType(advout, rdvt, linfo)
         rdvar_tmp = from_symbol(rdv_tmp, linfo)
         if parallel_reduction
             if isPrimitiveJuliaType(rdvt)
@@ -2125,7 +2550,7 @@ function from_parforstart(args, linfo)
             rdsextra *= "$rdvtyp $(rdvar) = shared_$(rdvar);\n"
         else
             if isDistributedMode() && lstate.ompdepth == 1
-                if pattern_match_reduce_sum(rd.reductionFunc, linfo)
+                if pattern_match_reduce_sum(rd.reductionFunc, linfo) && !isArrayType(rdvt)
                     rdsclause *= "reduction(+: $(rdvar)) "
                 end
             end
@@ -2141,7 +2566,7 @@ function from_parforstart(args, linfo)
     @dprintln(3, "rdsprolog = ", rdsprolog)
     @dprintln(3, "rdsclause = ", rdsclause)
 
-    if isDistributedMode() && lstate.ompdepth == 1 && rdsclause != ""
+    if isDistributedMode() && lstate.ompdepth == 1 && parfor.force_simd
         s *= "$rdsprolog #pragma simd $rdsclause\n"
         s *= loopheaders
         return s
@@ -2291,6 +2716,10 @@ function from_parallel_loopend(args,linfo)
     s
 end
 
+function from_expr(ast::CGen_boolean_and, linfo)
+    "((" * from_expr(ast.lhs, linfo) * ") && (" * from_expr(ast.rhs, linfo) * "))"
+end
+
 function from_expr(ast::Expr, linfo)
     s = ""
     head = ast.head
@@ -2337,11 +2766,17 @@ function from_expr(ast::Expr, linfo)
         @dprintln(3,"Compiling call")
         fun  = getCallFunction(ast)
         args = getCallArguments(ast)
-        s *= from_call([fun; args], linfo)
+        s *= from_call([fun; args], linfo, typ)
+
+    elseif head == :foreigncall
+        @dprintln(3,"Compiling foreigncall")
+        fun  = getCallFunction(ast)
+        args = getCallArguments(ast)
+        s *= from_foreigncall([fun; args], linfo, typ)
 
     elseif head == :call1
         @dprintln(3,"Compiling call1")
-        s *= from_call1(args, linfo)
+        s *= from_call1(args, linfo, typ)
 
     elseif head == :return
         @dprintln(3,"Compiling return")
@@ -2471,13 +2906,13 @@ function from_expr(ast::Char, linfo)
 end
 
 function from_expr(ast::Union{Int8,UInt8,Int16,UInt16,Int32,UInt32,Int64,UInt64,Float16, Float32,Float64,Bool,Char,Void}, linfo)
-    if is(ast, Inf)
+    if (ast === Inf)
       "DBL_MAX"
-    elseif is(ast, Inf32)
+    elseif (ast === Inf32)
       "FLT_MAX"
-    elseif is(ast, -Inf)
+    elseif (ast === -Inf)
       "DBL_MIN"
-    elseif is(ast, -Inf32)
+    elseif (ast === -Inf32)
       "FLT_MIN"
     elseif isa(ast, Int64) && (ast >= (1<<31) || ast < -(1<<31))
       string("0x", hex(ast), "LL")
@@ -2630,6 +3065,16 @@ end
 createMain = false
 function setCreateMain(val)
     global createMain = val
+end
+
+recreateLoops = false
+function setRecreateLoops(val)
+    global recreateLoops = val
+end
+
+recreateConds = false
+function setRecreateConds(val)
+    global recreateConds = val
 end
 
 # Creates an entrypoint that dispatches onto host or MIC.
@@ -2940,6 +3385,7 @@ function from_root_entry(ast, functionName::AbstractString, argtyps, array_types
     end
     @dprintln(3, "LambdaVarInfo = ", linfo)
     @dprintln(3, "body = ", body)
+
     params = CompilerTools.LambdaHandling.getInputParametersAsExpr(linfo)
     returnType = CompilerTools.LambdaHandling.getReturnType(linfo)
     # Translate the body
@@ -3018,6 +3464,7 @@ function from_root_nonentry(ast, functionName::AbstractString, argtyps, array_ty
     end
     @dprintln(3,"linfo = ", linfo)
     @dprintln(3,"body = ", body)
+
     params = CompilerTools.LambdaHandling.getInputParametersAsExpr(linfo)
     returnType = CompilerTools.LambdaHandling.getReturnType(linfo)
     # Translate the body
@@ -3069,20 +3516,20 @@ function insert(func::Symbol, name, typs)
     insert(target, name, typs)
 end
 
+funcToLambdaInfo(func, typs) = ParallelAccelerator.Driver.code_typed(func, typs)
+
 function insert(func::Function, name, typs)
     global lstate
-    #ast = code_typed(func, typs; optimize=true)
-    ast = ParallelAccelerator.Driver.code_typed(func, typs)
+    ast = funcToLambdaInfo(func, typs)
     if !isFunctionCompiled(name,typs)
-        @dprintln(3, "Adding function ", name, " to worklist.")
+        @dprintln(3, "Adding function ", name, " to worklist. ", ast, " ", typeof(ast))
         push!(lstate.worklist, (ast, name, typs))
     end
 end
 
 function insert(func::IntrinsicFunction, name, typs)
     global lstate
-    #ast = code_typed(func, typs; optimize=true)
-    ast = ParallelAccelerator.Driver.code_typed(func, typs)
+    ast = funcToLambdaInfo(func, typs)
     if !isFunctionCompiled(name,typs)
         @dprintln(3, "Adding intrinsic function ", name, " to worklist.")
         push!(lstate.worklist, (ast, name, typs))
@@ -3106,23 +3553,21 @@ function from_worklist()
         empty!(lstate.symboltable)
         empty!(lstate.ompprivatelist)
         if isa(a, Symbol)
-            a = ParallelAccelerator.Driver.code_typed(a, typs)
+            @dprintln(3,"a is a Symbol, calling code_typed")
+            a = funcToLambdaInfo(a, typs)
         end
-        if length(a) != 1
-            error("Error: expect 1 AST for ", a, " with signature ", typs, " but got: ", length(a))
-        else
-            @dprintln(3,"============ Compiling AST for ", fname, " ============")
-            fi, si = from_root_nonentry(a[1], fname, typs, Dict{DataType,Int64}())
-            @dprintln(3,"============== C++ after compiling ", fname, " ===========")
-            @dprintln(3,si)
-            @dprintln(3,"============== End of C++ for ", fname, " ===========")
-            @dprintln(3,"Adding ", (fname,typs), " to compiledFunctions")
-            @dprintln(3,lstate.compiledfunctions)
-            @dprintln(3,"Added ", (fname,typs), " to compiledFunctions")
-            @dprintln(3,lstate.compiledfunctions)
-            f *= fi
-            s *= si
-        end
+
+		@dprintln(3,"============ Compiling AST for ", fname, " ============")
+		fi, si = from_root_nonentry(a, fname, typs, Dict{DataType,Int64}())
+		@dprintln(3,"============== C++ after compiling ", fname, " ===========")
+		@dprintln(3,si)
+		@dprintln(3,"============== End of C++ for ", fname, " ===========")
+		@dprintln(3,"Adding ", (fname,typs), " to compiledFunctions")
+		@dprintln(3,lstate.compiledfunctions)
+		@dprintln(3,"Added ", (fname,typs), " to compiledFunctions")
+		@dprintln(3,lstate.compiledfunctions)
+		f *= fi
+		s *= si
     end
     f, s
 end

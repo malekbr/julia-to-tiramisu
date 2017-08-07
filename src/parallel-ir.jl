@@ -35,7 +35,8 @@ using CompilerTools.Helper
 using ..DomainIR
 using CompilerTools.AliasAnalysis
 import ..ParallelAccelerator
-if ParallelAccelerator.getPseMode() == ParallelAccelerator.THREADS_MODE
+#if ParallelAccelerator.getPseMode() == ParallelAccelerator.THREADS_MODE
+if VERSION >= v"0.5"
 using Base.Threads
 end
 
@@ -79,8 +80,6 @@ function getLoopPrivateFlags()
     end
 end
 
-unique_num = 1
-
 """
 Ad-hoc support to mimic closures when we want the arguments to be processed during AstWalk.
 """
@@ -90,6 +89,7 @@ type DelayedFunc
 end
 
 function callDelayedFuncWith(f::DelayedFunc, args...)
+    @dprintln(3,"callDelayedFuncWith f = ", f, " args = ", args...)
     full_args = vcat(f.args, Any[args...])
     f.func(full_args...)
 end
@@ -172,14 +172,22 @@ function EquivalenceClassesAdd(ec :: EquivalenceClasses, sym :: Symbol)
     ec.data[sym]
 end
 
+mk_call(fun,args) = Expr(:call, fun, args...)
+
+function boxOrNot(typ, expr)
+if VERSION >= v"0.6.0-pre"
+    return expr
+else
+    return mk_call(GlobalRef(Base, :box), [typ, expr]) 
+end
+end
+
 """
 Clear an equivalence class.
 """
 function EquivalenceClassesClear(ec :: EquivalenceClasses)
     empty!(ec.data)
 end
-
-mk_call(fun,args) = Expr(:call, fun, args...)
 
 function mk_mult_int_expr(args::Array)
     if length(args)==0
@@ -192,7 +200,7 @@ function mk_mult_int_expr(args::Array)
 
     while next<=length(args)
         m_call = mk_call(GlobalRef(Base,:mul_int),[prev_expr,args[next]])
-        prev_expr  = mk_call(GlobalRef(Base,:box),[Int64,m_call])
+        prev_expr  = boxOrNot(Int64, m_call)
         next += 1
     end
     return prev_expr
@@ -271,7 +279,7 @@ function isequal(x :: SingularSelector, y :: SingularSelector)
     isequal(x.value, y.value)
 end
 
-typealias DimensionSelector Union{RangeData, MaskSelector, SingularSelector}
+const DimensionSelector = Union{RangeData, MaskSelector, SingularSelector}
 
 function hash(x :: Array{DimensionSelector,1})
     @dprintln(4, "Array{DimensionSelector,1} hash")
@@ -321,17 +329,17 @@ type InputInfo
     array                                # The name of the array.
     dim                                  # The number of dimensions.
     out_dim                              # The number of indexed (non-const) dimensions.
-    indexed_dims                         # Length of dim where 1 means we index that dimension and 0 means we don't (it is singular).
+    indexed_dims :: Array{Bool,1}        # Length of dim where true means we index that dimension and false means we don't (it is singular).
     range :: Array{DimensionSelector,1}  # Empty if whole array, else one RangeData or BitArray mask per dimension.
     elementTemp                          # New temp variable to hold the value of this array/range at the current point in iteration space.
     pre_offsets :: Array{Expr,1}         # Assignments that go in the pre-statements that hold range offsets for each dimension.
     rangeconds :: Array{Expr,1}          # If selecting based on bitarrays, conditional for selecting elements
 
     function InputInfo()
-        new(nothing, 0, 0, nothing, DimensionSelector[], nothing, Expr[], Expr[])
+        new(nothing, 0, 0, Bool[], DimensionSelector[], nothing, Expr[], Expr[])
     end
     function InputInfo(arr)
-        new(arr, 0, 0, nothing, DimensionSelector[], nothing, Expr[], Expr[])
+        new(arr, 0, 0, Bool[], DimensionSelector[], nothing, Expr[], Expr[])
     end
 end
 
@@ -356,6 +364,7 @@ type PIRParForAst
     first_input  :: InputInfo
     body                                      # holds the body of the innermost loop (outer loops can't have anything in them except inner loops)
     preParFor    :: Array{Any,1}              # do these statements before the parfor
+    hoisted      :: Array{Any,1}              # statements hoisted from inside the body (do these statements before the parfor)
     loopNests    :: Array{PIRLoopNest,1}      # holds information about the loop nests
     reductions   :: Array{PIRReduction,1}     # holds information about the reductions
     postParFor   :: Array{Any,1}              # do these statements after the parfor
@@ -374,8 +383,9 @@ type PIRParForAst
     arrays_written_past_index :: Set{LHSVar}
     arrays_read_past_index :: Set{LHSVar}
 
-    function PIRParForAst(fi, b, pre, nests, red, post, orig, t, unique, wrote_past_index, read_past_index)
-        new(fi, b, pre, nests, red, post, orig, [t], unique, Dict{Symbol,Symbol}(), nothing, wrote_past_index, read_past_index)
+    force_simd::Bool # generate pragma simd in backend
+    function PIRParForAst(fi, b, pre, hoisted, nests, red, post, orig, t, unique, wrote_past_index, read_past_index)
+        new(fi, b, pre, hoisted, nests, red, post, orig, [t], unique, Dict{Symbol,Symbol}(), nothing, wrote_past_index, read_past_index, false)
     end
 end
 
@@ -395,6 +405,7 @@ Search a whole PIRParForAst object and replace one RHSVar with another.
 function replaceParforWithDict(parfor :: PIRParForAst, gensym_map, linfo :: LambdaVarInfo)
     parfor.body = CompilerTools.LambdaHandling.replaceExprWithDict!(parfor.body, gensym_map, linfo)
     parfor.preParFor = CompilerTools.LambdaHandling.replaceExprWithDict!(parfor.preParFor, gensym_map, linfo)
+    parfor.hoisted = CompilerTools.LambdaHandling.replaceExprWithDict!(parfor.hoisted, gensym_map, linfo)
     for i = 1:length(parfor.loopNests)
         parfor.loopNests[i].lower = CompilerTools.LambdaHandling.replaceExprWithDict!(parfor.loopNests[i].lower, gensym_map, linfo)
         parfor.loopNests[i].upper = CompilerTools.LambdaHandling.replaceExprWithDict!(parfor.loopNests[i].upper, gensym_map, linfo)
@@ -417,6 +428,7 @@ type PIRParForStartEnd
     reductions :: Array{PIRReduction,1}     # holds information about the reductions
     instruction_count_expr
     private_vars :: Array{RHSVar,1}
+    force_simd::Bool
 end
 
 """
@@ -438,6 +450,7 @@ type expr_state
     max_label :: Int # holds the max number of all LabelNodes
     multi_correlation::Int # correlation number for arrays with multiple assignment
     in_nested :: Bool
+    tuple_assigns :: Dict{LHSVar,Array{Any,1}}
 
     # Initialize the state for parallel IR translation.
     function expr_state(function_name, bl, max_label, input_arrays)
@@ -448,7 +461,7 @@ type expr_state
         for i = 1:length(input_arrays)
             init_corr[input_arrays[i]] = i
         end
-        new(function_name, bl, 0, length(input_arrays)+1, init_corr, init_sym_corr, init_tup_table, Dict{Array{DimensionSelector,1},Int}(), CompilerTools.LambdaHandling.LambdaVarInfo(), max_label, 0, false)
+        new(function_name, bl, 0, length(input_arrays)+1, init_corr, init_sym_corr, init_tup_table, Dict{Array{DimensionSelector,1},Int}(), CompilerTools.LambdaHandling.LambdaVarInfo(), max_label, 0, false, Dict{LHSVar,Array{Any,1}}())
     end
 end
 
@@ -466,8 +479,17 @@ function show(io::IO, pnode::ParallelAccelerator.ParallelIR.PIRParForAst)
         println(io,"Prestatements: ")
         for i = 1:length(pnode.preParFor)
             println(io,"    ", pnode.preParFor[i])
-            if DEBUG_LVL >= 4
+            if DEBUG_LVL >= 5
                 dump(pnode.preParFor[i])
+            end
+        end
+    end
+    if length(pnode.hoisted) > 0
+        println(io,"Hoisted: ")
+        for i = 1:length(pnode.hoisted)
+            println(io,"    ", pnode.hoisted[i])
+            if DEBUG_LVL >= 5
+                dump(pnode.hoisted[i])
             end
         end
     end
@@ -475,14 +497,14 @@ function show(io::IO, pnode::ParallelAccelerator.ParallelIR.PIRParForAst)
     for i = 1:length(pnode.body)
         println(io,"    ", pnode.body[i])
     end
-    if DEBUG_LVL >= 4
+    if DEBUG_LVL >= 5
         dump(pnode.body)
     end
     if length(pnode.loopNests) > 0
         println(io,"Loop Nests: ")
         for i = 1:length(pnode.loopNests)
             println(io,"    ", pnode.loopNests[i])
-            if DEBUG_LVL >= 4
+            if DEBUG_LVL >= 5
                 dump(pnode.loopNests[i])
             end
         end
@@ -497,12 +519,12 @@ function show(io::IO, pnode::ParallelAccelerator.ParallelIR.PIRParForAst)
         println(io,"Poststatements: ")
         for i = 1:length(pnode.postParFor)
             println(io,"    ", pnode.postParFor[i])
-            if DEBUG_LVL >= 4
+            if DEBUG_LVL >= 5
                 dump(pnode.postParFor[i])
             end
         end
     end
-    if length(pnode.original_domain_nodes) > 0 && DEBUG_LVL >= 4
+    if length(pnode.original_domain_nodes) > 0 && DEBUG_LVL >= 5
         println(io,"Domain nodes: ")
         for i = 1:length(pnode.original_domain_nodes)
             println(io,pnode.original_domain_nodes[i])
@@ -656,14 +678,26 @@ end
 Return an expression that allocates and initializes a 1D Julia array that has an element type specified by
 "elem_type", an array type of "atype" and a "length".
 """
-function mk_alloc_array_1d_expr(elem_type, atype, length)
+function mk_alloc_array_expr(elem_type, atype, length)
     @dprintln(2,"mk_alloc_array_1d_expr atype = ", atype, " elem_type = ", elem_type, " length = ", length, " typeof(length) = ", typeof(length))
     ret_type = TypedExpr(Type{atype},  :call, GlobalRef(Core, :apply_type), GlobalRef(Core, :Array), elem_type, 1)
     new_svec = TypedExpr(SimpleVector, :call, GlobalRef(Core, :svec), GlobalRef(Base, :Any), GlobalRef(Base, :Int))
 
     length_expr = get_length_expr(length)
 
-    TypedExpr(
+if VERSION >= v"0.6.0-pre"
+    return TypedExpr(
+       atype,
+       :foreigncall,
+       QuoteNode(:jl_alloc_array_1d),
+       atype,
+       eval(new_svec),
+       atype,
+       0,
+       length_expr,
+       0)
+else
+    return TypedExpr(
        atype,
        :call,
        GlobalRef(Core,:ccall),
@@ -674,6 +708,7 @@ function mk_alloc_array_1d_expr(elem_type, atype, length)
        0,
        length_expr,
        0)
+end
 end
 
 function get_length_expr(length::Union{RHSVar,Int64})
@@ -692,12 +727,27 @@ end
 Return an expression that allocates and initializes a 2D Julia array that has an element type specified by
 "elem_type", an array type of "atype" and two dimensions of length in "length1" and "length2".
 """
-function mk_alloc_array_2d_expr(elem_type, atype, length1, length2)
+function mk_alloc_array_expr(elem_type, atype, length1, length2)
     @dprintln(2,"mk_alloc_array_2d_expr atype = ", atype)
 
     ret_type = TypedExpr(Type{atype},  :call, GlobalRef(Core, :apply_type), GlobalRef(Core, :Array), elem_type, 2)
     new_svec = TypedExpr(SimpleVector, :call, GlobalRef(Core,:svec), GlobalRef(Base, :Any), GlobalRef(Base, :Int), GlobalRef(Base, :Int))
 
+if VERSION >= v"0.6.0-pre"
+    TypedExpr(
+       atype,
+       :foreigncall,
+       QuoteNode(:jl_alloc_array_2d),
+       atype,
+       eval(new_svec),
+       atype,
+       0,
+       get_length_expr(length1),
+       0,
+       get_length_expr(length2),
+       0
+       )
+else
     TypedExpr(
        atype,
        :call,
@@ -713,16 +763,33 @@ function mk_alloc_array_2d_expr(elem_type, atype, length1, length2)
        0
        )
 end
+end
 
 """
 Return an expression that allocates and initializes a 3D Julia array that has an element type specified by
 "elem_type", an array type of "atype" and two dimensions of length in "length1" and "length2" and "length3".
 """
-function mk_alloc_array_3d_expr(elem_type, atype, length1, length2, length3)
+function mk_alloc_array_expr(elem_type, atype, length1, length2, length3)
     @dprintln(2,"mk_alloc_array_3d_expr atype = ", atype)
     ret_type = TypedExpr(Type{atype},  :call, GlobalRef(Core, :apply_type), GlobalRef(Core, :Array), elem_type, 3)
     new_svec = TypedExpr(SimpleVector, :call, GlobalRef(Core, :svec), GlobalRef(Base, :Any), GlobalRef(Base, :Int), GlobalRef(Base, :Int), GlobalRef(Base, :Int))
 
+if VERSION >= v"0.6.0-pre"
+    TypedExpr(
+       atype,
+       :foreigncall,
+       QuoteNode(:jl_alloc_array_3d),
+       atype,
+       eval(new_svec),
+       atype,
+       0,
+       get_length_expr(length1),
+       0,
+       get_length_expr(length2),
+       0,
+       get_length_expr(length3),
+       0)
+else
     TypedExpr(
        atype,
        :call,
@@ -738,6 +805,7 @@ function mk_alloc_array_3d_expr(elem_type, atype, length1, length2, length3)
        0,
        get_length_expr(length3),
        0)
+end
 end
 
 """
@@ -960,14 +1028,26 @@ function nonExactRangeSearch(ranges :: Array{DimensionSelector,1}, range_correla
 end
 
 
-"""
-If we need to generate a name and make sure it is unique then include an monotonically increasing number.
-"""
-function get_unique_num()
-    ret = unique_num
-    global unique_num = unique_num + 1
-    ret
+if VERSION >= v"0.5"
+    unique_num = Atomic{Int}(1)
+    """
+    If we need to generate a name and make sure it is unique then include an monotonically increasing number.
+    """
+    function get_unique_num()
+        atomic_add!(unique_num, 1)
+    end
+else
+    unique_num = 1
+    """
+    If we need to generate a name and make sure it is unique then include an monotonically increasing number.
+    """
+    function get_unique_num()
+        ret = unique_num
+        global unique_num = unique_num + 1
+        ret
+    end
 end
+
 
 # ===============================================================================================================================
 
@@ -1097,7 +1177,7 @@ Process a :lambda Expr.
 function from_lambda(lambda :: Expr, depth, state)
     # :lambda expression
     assert(lambda.head == :lambda)
-    @dprintln(4,"from_lambda starting")
+    @dprintln(3,"from_lambda starting")
 
     # Save the current LambdaVarInfo away so we can restore it later.
     save_LambdaVarInfo  = state.LambdaVarInfo
@@ -1226,7 +1306,7 @@ Returns true if the domain operation mapped to this parfor has the property that
 is identical to the dimenions of the inputs.
 """
 function iterations_equals_inputs(node :: ParallelAccelerator.ParallelIR.PIRParForAst)
-    assert(length(node.original_domain_nodes) > 0)
+    @assert length(node.original_domain_nodes)>0 "parfor original_domain_nodes is empty"
 
     first_domain_node = node.original_domain_nodes[1]
     first_type = first_domain_node.operation
@@ -1377,13 +1457,45 @@ function getAllAliases(input :: Set{LHSVar}, aliases :: Dict{LHSVar, LHSVar})
 end
 
 function isAllocation(expr :: Expr)
-    return expr.head == :call &&
-    isBaseFunc(expr.args[1], :ccall) &&
-    (expr.args[2] == QuoteNode(:jl_alloc_array_1d) || expr.args[2] == QuoteNode(:jl_alloc_array_2d) || expr.args[2] == QuoteNode(:jl_alloc_array_3d) || expr.args[2] == QuoteNode(:jl_new_array))
+    if (expr.head == :call && isBaseFunc(expr.args[1], :ccall)) || expr.head == :foreigncall
+        call_offset = getCallOffset(expr)        
+        if expr.args[call_offset] == QuoteNode(:jl_alloc_array_1d) || 
+           expr.args[call_offset] == QuoteNode(:jl_alloc_array_2d) || 
+           expr.args[call_offset] == QuoteNode(:jl_alloc_array_3d) || 
+           expr.args[call_offset] == QuoteNode(:jl_new_array)
+            return true
+        end
+    end
+    return false
 end
 
 function isAllocation(expr)
     return false
+end
+
+function getCallOffset(expr :: Expr)
+    if expr.head == :call
+        assert(isBaseFunc(expr.args[1], :ccall))
+        return 2
+    elseif expr.head == :foreigncall
+        return 1
+    else
+        throw(string("getFirstAllocSize called for a non-allocation."))
+    end
+end
+
+function getFirstAllocSize(expr :: Expr)
+    call_offset = getCallOffset(expr)
+    size_offset = call_offset + 5
+
+    if expr.args[call_offset] == QuoteNode(:jl_alloc_array_1d)
+        num_dim = 1
+    elseif expr.args[call_offset] == QuoteNode(:jl_alloc_array_2d)
+        num_dim = 2
+    elseif expr.args[call_offset] == QuoteNode(:jl_alloc_array_3d)
+        num_dim = 3
+    end
+    return num_dim, size_offset
 end
 
 # Takes one statement in the preParFor of a parfor and a set of variables that we've determined we can eliminate.
@@ -1539,6 +1651,9 @@ function getFirstArrayLens(parfor, num_dims, state)
                 rhs = x.args[2]
                 if isa(rhs, Expr) && (rhs.head == :call) && isBaseFunc(rhs.args[1],:arraysize)
                     push!(ret, toRHSVar(lhs, state.LambdaVarInfo))
+                end
+                if length(ret) == num_dims
+                    return ret
                 end
             end
         end
@@ -1705,7 +1820,7 @@ function is_eliminated_arraysize(x::Expr, removed_allocs :: Set, aliases)
     if x.head == :(=)
         rhs = x.args[2]
         if isa(rhs, Expr) && rhs.head == :call
-            @dprintln(3,"is_eliminated_arraylen is :call")
+            @dprintln(5,"is_eliminated_arraylen is :call")
             if isBaseFunc(rhs.args[1], :arraysize)
                 array_used_lhsvar = toLHSVar(rhs.args[2])
                 array_used_aliases = getAllAliases(array_used_lhsvar, aliases)
@@ -1736,7 +1851,7 @@ function is_eliminated_arraylen(x::Expr)
     if x.head == :(=)
         rhs = x.args[2]
         if isa(rhs, Expr) && rhs.head == :call
-            @dprintln(3,"is_eliminated_arraylen is :call")
+            @dprintln(5,"is_eliminated_arraylen is :call")
             if isBaseFunc(rhs.args[1], :arraysize)
                 @dprintln(3,"is_eliminated_arraylen is :arraysize")
                 return true
@@ -1762,14 +1877,17 @@ function sub_arraylen_walk(x::Expr, replacement, top_level_number, is_top_level,
 
     if x.head == :(=)
         rhs = x.args[2]
-        if isa(rhs, Expr) && rhs.head == :call
-            if isBaseFunc(rhs.args[1], :ccall)
-                if rhs.args[2] == QuoteNode(:jl_alloc_array_1d)
-                    rhs.args[7] = replacement[1]
-                elseif rhs.args[2] == QuoteNode(:jl_alloc_array_2d)
-                    rhs.args[7] = replacement[1]
-                    rhs.args[9] = replacement[2]
-                end
+        if isAllocation(rhs)
+            num_dim, size_offset = getFirstAllocSize(rhs)
+            if num_dim == 1
+                rhs.args[size_offset] = replacement[1]
+            elseif num_dim == 2
+                rhs.args[size_offset] = replacement[1]
+                rhs.args[size_offset+2] = replacement[2]
+            elseif num_dim == 3
+                rhs.args[size_offset] = replacement[1]
+                rhs.args[size_offset+2] = replacement[2]
+                rhs.args[size_offset+4] = replacement[3]
             end
         end
     end
@@ -1869,11 +1987,22 @@ function getCorrelation(array :: RHSVar, are :: Array{DimensionSelector,1}, stat
 end
 
 function getCorrelation(inputInfo :: InputInfo, state :: expr_state)
+    @dprintln(3, "getCorrelation for inputInfo = ", inputInfo)
     num_dim_inputs = findSelectedDimensions([inputInfo], state)
-    @dprintln(3, "getCorrelation for inputInfo num_dim_inputs = ", num_dim_inputs)
+    @dprintln(3, "num_dim_inputs = ", num_dim_inputs)
     if num_dim_inputs == 0 return nothing end
     if isRange(inputInfo)
-        return getCorrelation(inputInfo.array, inputInfo.range[1:num_dim_inputs], state)
+        assert(length(inputInfo.indexed_dims) == length(inputInfo.range))
+        canonical_range = DimensionSelector[
+            if inputInfo.indexed_dims[i]
+                inputInfo.range[i]
+            else
+                SingularSelector(0,SlotNumber(0))
+            end
+            for i = 1:length(inputInfo.indexed_dims)]
+        return getCorrelation(inputInfo.array, canonical_range, state)
+        #return getCorrelation(inputInfo.array, inputInfo.range[inputInfo.indexed_dims], state)
+        #return getCorrelation(inputInfo.array, inputInfo.range[1:num_dim_inputs], state)
     else
         return getCorrelation(inputInfo.array, state)
     end
@@ -2103,6 +2232,7 @@ function pir_rws_cb(ast :: Expr, cbdata :: ANY)
         this_parfor = args[1]
 
         append!(expr_to_process, this_parfor.preParFor)
+        append!(expr_to_process, this_parfor.hoisted)
         for i = 1:length(this_parfor.loopNests)
             # force the indexVariable to be treated as an rvalue
             push!(expr_to_process, mk_untyped_assignment(this_parfor.loopNests[i].indexVariable, 1))
@@ -2112,7 +2242,7 @@ function pir_rws_cb(ast :: Expr, cbdata :: ANY)
         end
         assert(typeof(cbdata) == CompilerTools.LambdaHandling.LambdaVarInfo)
         body = CompilerTools.LambdaHandling.getBody(this_parfor.body, CompilerTools.LambdaHandling.getReturnType(cbdata))
-        body_rws = CompilerTools.ReadWriteSet.from_expr(body, pir_rws_cb, cbdata)
+        body_rws = CompilerTools.ReadWriteSet.from_expr(body, pir_rws_cb, cbdata, cbdata)
         push!(expr_to_process, body_rws)
         append!(expr_to_process, this_parfor.postParFor)
         return expr_to_process
@@ -2134,6 +2264,25 @@ function pir_rws_cb(ast :: Expr, cbdata :: ANY)
 
             tcopy = deepcopy(ast)
             tcopy.args[1] = GlobalRef(Base, :arrayset)
+            push!(expr_to_process, tcopy)
+            return expr_to_process
+        elseif cfun == GlobalRef(ParallelAccelerator.API, :SubArrayLastDimRead)
+            @dprintln(3,"pir_rws_cb for :SubArrayLastDimRead call")
+            @dprintln(3,"ast = ", ast)
+            tcopy = deepcopy(ast)
+            tcopy.args[1] = GlobalRef(Base, :arrayref)
+            tcopy.args[3] = Colon()
+            push!(tcopy.args, deepcopy(cargs[2]))
+            push!(expr_to_process, tcopy)
+            return expr_to_process
+        elseif cfun == GlobalRef(ParallelAccelerator.API, :SubArrayLastDimWrite)
+            @dprintln(3,"pir_rws_cb for :SubArrayLastDimWrite call")
+            @dprintln(3,"ast = ", ast)
+            tcopy = deepcopy(ast)
+            tcopy.args[1] = GlobalRef(Base, :arrayset)
+            tcopy.args[3] = 1
+            push!(tcopy.args, Colon())
+            push!(tcopy.args, deepcopy(cargs[2]))
             push!(expr_to_process, tcopy)
             return expr_to_process
         end
@@ -2170,6 +2319,7 @@ function pir_live_cb(ast :: Expr, cbdata :: ANY)
         this_parfor = args[1]
 
         append!(expr_to_process, this_parfor.preParFor)
+        append!(expr_to_process, this_parfor.hoisted)
         for i = 1:length(this_parfor.loopNests)
             # force the indexVariable to be treated as an rvalue
             push!(expr_to_process, mk_untyped_assignment(this_parfor.loopNests[i].indexVariable, 1))
@@ -2314,6 +2464,10 @@ function hasNoSideEffects(node :: Union{Symbol, LHSVar, RHSVar, GlobalRef, DataT
     return true
 end
 
+if VERSION >= v"0.6.0-pre"
+import CompilerTools.LambdaHandling.LambdaInfo
+end
+
 function hasNoSideEffects(node :: Union{QuoteNode, LambdaInfo, Number, Function})
     return true
 end
@@ -2337,6 +2491,15 @@ function hasNoSideEffects(node :: Expr)
             newtyp = getfield(newtyp.mod, newtyp.name)
         end
         return isa(newtyp, Type) && (newtyp <: Range || newtyp <: Function)
+    elseif node.head == :foreigncall
+        func = CompilerTools.Helper.getCallFunction(node)
+        args = CompilerTools.Helper.getCallArguments(node)
+        if func == QuoteNode(:jl_alloc_array_1d) ||
+           func == QuoteNode(:jl_alloc_array_2d) ||
+           func == QuoteNode(:jl_alloc_array_3d)
+            @dprintln(3,"hasNoSideEffects found allocation returning true")
+            return true
+        end
     elseif node.head == :call1 || node.head == :call || node.head == :invoke
         func = CompilerTools.Helper.getCallFunction(node)
         args = CompilerTools.Helper.getCallArguments(node)
@@ -2354,6 +2517,8 @@ function hasNoSideEffects(node :: Expr)
             isBaseFunc(func, :add_int) ||
             isBaseFunc(func, :mul_int) ||
             isBaseFunc(func, :neg_int) ||
+            isBaseFunc(func, :xor_int) ||
+            isBaseFunc(func, :flipsign_int) ||
             isBaseFunc(func, :checked_sadd) ||
             isBaseFunc(func, :checked_sadd_int) ||
             isBaseFunc(func, :checked_ssub) ||
@@ -2518,20 +2683,7 @@ function from_assignment(lhs, rhs, depth, state)
         out_typ = rhs.typ
         #@dprintln(3, "from_assignment rhs is Expr, type = ", out_typ, " rhs.head = ", rhs.head, " rhs = ", rhs)
 
-        # If we have "a = parfor(...)" then record that array "a" has the same length as the output array of the parfor.
-        if rhs.head == :parfor
-            the_parfor = rhs.args[1]
-            if !(isa(out_typ, Tuple)) && isArrayType(out_typ) # both lhs and out_typ could be a tuple
-                @dprintln(3,"Adding parfor array length correlation ", lhs, " to ", rhs.args[1].postParFor[end])
-                add_merge_correlations(toLHSVar(the_parfor.postParFor[end]), lhsName, state)
-            end
-            # assertEqShape nodes can prevent fusion and slow things down regardless so we can try to remove them
-            # statically if our array length correlations indicate they are in the same length set.
-        elseif rhs.head == :assertEqShape
-            if from_assertEqShape(rhs, state)
-                return [], nothing
-            end
-        elseif rhs.head == :call || rhs.head == :invoke
+        if rhs.head == :call || rhs.head == :invoke
             @dprintln(3, "Detected call rhs in from_assignment.")
             @dprintln(3, "from_assignment call, arg1 = ", rhs.args[1])
             if length(rhs.args) > 1
@@ -2539,39 +2691,23 @@ function from_assignment(lhs, rhs, depth, state)
             end
             fun = CompilerTools.Helper.getCallFunction(rhs)
             args = CompilerTools.Helper.getCallArguments(rhs)
-            if isBaseFunc(fun, :ccall)
-                if args[1] == QuoteNode(:jl_alloc_array_1d)
-                    dim1 = args[6]
-                    @dprintln(3, "Detected 1D array allocation. dim1 = ", dim1, " type = ", typeof(dim1))
-                    if isa(dim1, TypedVar)
-                        si1 = CompilerTools.LambdaHandling.getDesc(dim1, state.LambdaVarInfo)
-                        if si1 & ISASSIGNEDONCE == ISASSIGNEDONCE
-                            @dprintln(3, "Will establish array length correlation for const size ", dim1)
-                            getOrAddSymbolCorrelation(lhsName, state, Union{RHSVar,Int}[dim1])
-                        end
-                    end
-                elseif args[1] == QuoteNode(:jl_alloc_array_2d)
-                    dim1 = args[6]
-                    dim2 = args[8]
-                    @dprintln(3, "Detected 2D array allocation. dim1 = ", dim1, " dim2 = ", dim2)
-                    if isa(dim1, TypedVar) && isa(dim2, TypedVar)
-                        si1 = CompilerTools.LambdaHandling.getDesc(dim1, state.LambdaVarInfo)
-                        si2 = CompilerTools.LambdaHandling.getDesc(dim2, state.LambdaVarInfo)
-                        if (si1 & ISASSIGNEDONCE == ISASSIGNEDONCE) && (si2 & ISASSIGNEDONCE == ISASSIGNEDONCE)
-                            @dprintln(3, "Will establish array length correlation for const size ", dim1, " ", dim2)
-                            getOrAddSymbolCorrelation(lhsName, state, Union{RHSVar,Int}[dim1, dim2])
-                            print_correlations(3, state)
-                        end
-                    end
+            if isBaseFunc(fun, :tuple)
+                if haskey(state.tuple_assigns, lhsName)
+                    @dprintln(3, "tuple assignment already remembered for ", lhsName)
+                else
+                    @dprintln(3, "Remembering tuple assignment for ", lhsName)
+                    state.tuple_assigns[lhsName] = args
                 end
             end
         end
     elseif isa(rhs, TypedVar)
         out_typ = getType(rhs, state.LambdaVarInfo)
+        if false
         if isArrayType(out_typ)
             # Add a length correlation of the form "a = b".
             @dprintln(3,"Adding array length correlation ", lhs, " to ", rhs)
             add_merge_correlations(toLHSVar(rhs), lhsName, state)
+        end
         end
     else
         # Get the type of the lhs from its metadata declaration.
@@ -2584,13 +2720,39 @@ end
 """
 Process a call AST node. Note that it takes an Expr as input because it can be either :call or :invoke.
 """
-function from_call(ast::Expr, depth, state)
+function from_call(head, ast::Expr, depth, state)
     fun  = getCallFunction(ast)
     args = getCallArguments(ast)
     @dprintln(2,"from_call fun = ", fun, " typeof fun = ", typeof(fun))
     if length(args) > 0
         @dprintln(2,"first arg = ",args[1], " type = ", typeof(args[1]))
     end
+
+    if isBaseFunc(fun, :broadcast!) && args[1] == GlobalRef(Base, :identity)
+        @dprintln(3,"Detected call to broadcast! with identity argument.")
+        if length(args) == 3
+            arr1 = args[2]
+            arr2 = args[3]
+            arrtyp1 = CompilerTools.LambdaHandling.getType(arr1, state.LambdaVarInfo)
+            arrtyp2 = CompilerTools.LambdaHandling.getType(arr2, state.LambdaVarInfo)
+            eltyp1 = eltype(arrtyp1)
+            eltyp2 = eltype(arrtyp2)
+            @dprintln(3,"arr1 = ", arr1, " arr2 = ", arr2, " hasCorrelation1 = ", haskey(state.array_length_correlation, arr1), " hasCorrelation2 = ", haskey(state.array_length_correlation, arr2))
+            if haskey(state.array_length_correlation, arr1) && 
+               haskey(state.array_length_correlation, arr2) &&
+               state.array_length_correlation[arr1] == state.array_length_correlation[arr2]
+                @dprintln(3,"Arrays are equivalent in length.  Switch to copy! here.")
+                new_domain_expr = ParallelAccelerator.DomainIR.mk_mmap!(args[2:3], ParallelAccelerator.DomainIR.DomainLambda(Type[eltyp1,eltyp2], Type[eltyp1], params->Any[Expr(:tuple, params[2])], state.LambdaVarInfo))
+                @dprintln(3,"New mmap! = ", new_domain_expr)
+
+                head = :parfor
+                domain_oprs = [DomainOperation(:mmap!, args)]
+                args = mk_parfor_args_from_mmap!(new_domain_expr.args[1], new_domain_expr.args[2], false, domain_oprs, state)
+                return head, args
+            end
+        end
+    end
+
     # We don't need to translate Function Symbols but potentially other call targets we do.
     if typeof(fun) != Symbol
         fun = from_expr(fun, depth, state, false)
@@ -2601,7 +2763,23 @@ function from_call(ast::Expr, depth, state)
     # Recursively process the arguments to the call.
     args = from_exprs(args, depth+1, state)
 
-    return ast.head == :invoke ? [ast.args[1]; fun; args] : [fun; args]
+    return head, (ast.head == :invoke ? [ast.args[1]; fun; args] : [fun; args])
+end
+
+"""
+Process a foreigncall AST node.
+"""
+function from_foreigncall(ast::Expr, depth, state)
+    fun  = getCallFunction(ast)
+    args = getCallArguments(ast)
+    @dprintln(2,"from_foreigncall fun = ", fun, " typeof fun = ", typeof(fun))
+    if length(args) > 0
+        @dprintln(2,"first arg = ",args[1], " type = ", typeof(args[1]))
+    end
+    # Recursively process the arguments to the call.
+    args = from_exprs(args, depth+1, state)
+
+    return [fun; args]
 end
 
 """
@@ -2825,7 +3003,7 @@ function nested_function_exprs(domain_lambda, out_state)
     @dprintln(3,"Non-array escaping = ", non_array_escaping, " " , unique_node_id)
 
     # Find out max_label.
-    assert(isa(body, Expr) && is(body.head, :body))
+    assert(isa(body, Expr) && (body.head === :body))
     max_label = getMaxLabel(max_label, body.args)
 
     eq_start = time_ns()
@@ -3097,7 +3275,12 @@ function genEquivalenceClasses(linfo, body, new_vars)
     AstWalk(body, create_equivalence_classes, new_vars)
     # Using equivalence class info, replace Base.arraysize() calls for constant size arrays
     # A separate pass is better since this doesn't have to worry about statements being top level
-    AstWalk(body, replaceConstArraysizes, new_vars)
+    # replace range correlations if possible since they can be 1:arraysize()
+    ra_data = ReplaceConstArraysizesData(
+      new_vars.block_lives, new_vars.LambdaVarInfo, new_vars.array_length_correlation,
+        new_vars.symbol_array_correlation)
+    replaceConstArraysizesRangeCorrelations(new_vars.range_correlation, ra_data)
+    AstWalk(body, replaceConstArraysizes, ra_data)
 end
 
 """
@@ -3184,7 +3367,7 @@ function from_root(function_name, ast)
     @dprintln(3,"Non-array params = ", non_array_params, " function = ", function_name)
 
     # Find out max_label
-    assert(isa(body, Expr) && is(body.head, :body))
+    assert(isa(body, Expr) && (body.head === :body))
     max_label = getMaxLabel(0, body.args)
     @dprintln(3,"maxLabel = ", max_label, " body type = ", body.typ)
 
@@ -3304,16 +3487,22 @@ function from_root(function_name, ast)
         @dprintln(3,"AST before last copy_propagate = ", " function = ", function_name)
         printLambda(3, LambdaVarInfo, body)
         lives = computeLiveness(body, LambdaVarInfo)
-        new_vars.block_lives = lives
-        AstWalk(body, replaceConstArraysizes, new_vars)
+        new_vars = expr_state(function_name, lives, new_vars.max_label, input_arrays)
+        genEquivalenceClasses(LambdaVarInfo, body, new_vars)
+        print_correlations(3, new_vars)
+        #AstWalk(body, replaceConstArraysizes, new_vars)
         lives = computeLiveness(body, LambdaVarInfo)
         body = AstWalk(body, copy_propagate, CopyPropagateState(lives,LambdaVarInfo))
         lives = computeLiveness(body, LambdaVarInfo)
         body = AstWalk(body, remove_dead, RemoveDeadState(lives,LambdaVarInfo))
         body = update_lambda_vars(LambdaVarInfo, body)
+        @dprintln(3,"AST after late_simplify = ", " function = ", function_name)
+        printLambda(3, LambdaVarInfo, body)
     end
 
     if unroll_small_parfors
+        @dprintln(3,"AST at start of unroll_small_pafors = ", " function = ", function_name)
+        printLambda(3, LambdaVarInfo, body)
         body = AstWalk(body, unroll_const_parfors, nothing)
         # flatten body since unroll can return :block nodes
         body = AstWalk(body, flatten_blocks, nothing)
@@ -3322,6 +3511,8 @@ function from_root(function_name, ast)
         body = AstWalk(body, copy_propagate, CopyPropagateState(lives,LambdaVarInfo))
         lives = computeLiveness(body, LambdaVarInfo)
         body = AstWalk(body, remove_dead, RemoveDeadState(lives,LambdaVarInfo))
+        @dprintln(3,"AST at end of unroll_small_parfors = ", " function = ", function_name)
+        printLambda(3, LambdaVarInfo, body)
     end
 
     @dprintln(1,"Final ParallelIR function = ", function_name, " body = ")
@@ -3383,6 +3574,7 @@ Find arrays that are only allocated and not written to, and remove them.
 """
 function remove_extra_allocs(LambdaVarInfo, body)
     @dprintln(3,"starting remove extra allocs")
+    printLambda(3, LambdaVarInfo, body)
     old_lives = computeLiveness(body, LambdaVarInfo)
     # rm_allocs_live_cb callback ignores allocation calls but finds other defs of arrays
     lives = CompilerTools.LivenessAnalysis.from_lambda(LambdaVarInfo, body, rm_allocs_live_cb, LambdaVarInfo)
@@ -3392,8 +3584,9 @@ function remove_extra_allocs(LambdaVarInfo, body)
         defs = union(defs, i.def)
     end
     # only consider those that are not aliased
-    uniqsets = CompilerTools.AliasAnalysis.from_lambda(LambdaVarInfo, body, old_lives, pir_alias_cb, nothing)
-    @dprintln(3, "remove extra allocations defs ",defs)
+    @dprintln(3, "starting alias analysis")
+    uniqsets = CompilerTools.AliasAnalysis.from_lambda(LambdaVarInfo, body, old_lives, pir_alias_cb, nothing, noReAssign=true)
+    @dprintln(3, "remove extra allocations defs ", defs, " uniqsets = ", uniqsets)
     rm_state = rm_allocs_state(defs, uniqsets, Dict{LHSVar,Array{Any,1}}(), LambdaVarInfo)
     AstWalk(body, rm_allocs_cb, rm_state)
     return body
@@ -3407,12 +3600,14 @@ function rm_allocs_cb(ast::Expr, state::rm_allocs_state, top_level_number, is_to
     head = ast.head
     args = ast.args
     if head == :(=) && isAllocation(args[2])
+        @dprintln(3,"rm_allocs_cb isAllocation ast = ", ast)
         arr = toLHSVar(args[1])
         # do not remove those that are being re-defined, or potentially aliased
         if in(arr, state.defs) || !in(arr, state.uniqsets)
             return CompilerTools.AstWalker.ASTWALK_RECURSE
         end
-        alloc_args = args[2].args[2:end]
+        call_offset = getCallOffset(args[2])
+        alloc_args = args[2].args[call_offset:end]
         @dprintln(3,"alloc_args =", alloc_args)
         sh::Array{Any,1} = get_alloc_shape(alloc_args)
         shape = map(x -> if isa(x, Expr) x else toLHSVarOrInt(x) end, sh)
@@ -3425,7 +3620,6 @@ function rm_allocs_cb(ast::Expr, state::rm_allocs_state, top_level_number, is_to
         if length(args)>=2
             return rm_allocs_cb_call(state, args[1], args[2], args[3:end])
         end
-
     # remove extra arrays from parfor data structures
     elseif head==:parfor
         rm_allocs_cb_parfor(state, args[1])
@@ -3559,7 +3753,7 @@ end
 The main ParallelIR function for processing some node in the AST.
 """
 function from_expr(ast ::Expr, depth, state :: expr_state, top_level)
-    if is(ast, nothing)
+    if (ast === nothing)
         return [nothing]
     end
     @dprintln(2,"from_expr depth=",depth," ")
@@ -3594,8 +3788,10 @@ function from_expr(ast ::Expr, depth, state :: expr_state, top_level)
     elseif head == :return
         args = from_exprs(args, depth, state)
     elseif head == :invoke || head == :call || head == :call1
-        args = from_call(ast, depth, state)
+        head, args = from_call(head, ast, depth, state)
         # TODO: catch domain IR result here
+    elseif head == :foreigncall
+        args = from_foreigncall(ast, depth, state)
     elseif head == :line
         # remove line numbers
         return []
@@ -3652,8 +3848,7 @@ function from_expr(ast ::Expr, depth, state :: expr_state, top_level)
         args = vcat(GlobalRef(Base, :arraysize), args)
     elseif head == :alloc
         # turn array alloc back to plain Julia ccall
-        head = :call
-        args = from_alloc(args)
+        head, args = from_alloc(args, state)
     elseif head == :stencil!
         head = :parfor
         ast = mk_parfor_args_from_stencil(typ, head, args, state)
@@ -3687,6 +3882,10 @@ function from_expr(ast ::Expr, depth, state :: expr_state, top_level)
         # skip
     elseif head == :type_goto
         # skip
+    elseif head == :llvmcall
+        # skip
+    elseif head == :simdloop
+        # skip
     elseif head in DomainIR.exprHeadIgnoreList
         # other packages like HPAT can generate new nodes like :alloc, :join
     else
@@ -3698,20 +3897,52 @@ function from_expr(ast ::Expr, depth, state :: expr_state, top_level)
     return [ast]
 end
 
-function from_alloc(args::Array{Any,1})
+function createForeignCall(realArgs)
+if VERSION >= v"0.6.0-pre"
+    return :foreigncall, realArgs
+else
+    return :call, vcat(GlobalRef(Core,:ccall), realArgs)
+end
+end
+
+function from_alloc(args::Array{Any,1}, state)
     elemTyp = args[1]
     sizes = args[2]
     n = length(sizes)
     assert(n >= 1 && n <= 3)
+
+    @dprintln(3, "from_alloc: elemTyp = ", elemTyp, " sizes = ", sizes)
+
+    if n == 1
+        only_size = sizes[1] 
+        os_type = CompilerTools.LambdaHandling.getType(only_size, state.LambdaVarInfo)
+        @dprintln(3, "from_alloc: only_size ", only_size, " has typ = ", os_type)
+        if os_type <: Tuple
+            if haskey(state.tuple_assigns, only_size)
+                @dprintln(3, "from_alloc: found declaration for tuple")
+                sizes = state.tuple_assigns[only_size]
+                n = length(sizes)
+                assert(n >= 1 && n <= 3)
+            else
+                @dprintln(3, "from_alloc: did not find declaration for tuple")
+            end
+        end
+    end
+
     name = Symbol(string("jl_alloc_array_", n, "d"))
-    appTypExpr = TypedExpr(Type{Array{elemTyp,n}}, :call, GlobalRef(Core, :apply_type), GlobalRef(Core,:Array), elemTyp, n)
     new_svec = TypedExpr(SimpleVector, :call, GlobalRef(Core, :svec), GlobalRef(Base, :Any), [ GlobalRef(Base, :Int) for i=1:n ]...)
+if VERSION >= v"0.6.0-pre"
+    appTypExpr = Array{elemTyp,n}
+    new_svec = eval(new_svec)
+else
+    appTypExpr = TypedExpr(Type{Array{elemTyp,n}}, :call, GlobalRef(Core, :apply_type), GlobalRef(Core,:Array), elemTyp, n)
+end
     realArgs = Any[QuoteNode(name), appTypExpr, new_svec, Array{elemTyp,n}, 0]
     for i=1:n
         push!(realArgs, sizes[i])
         push!(realArgs, 0)
     end
-    return vcat(GlobalRef(Core,:ccall), realArgs)
+    return createForeignCall(realArgs)
 end
 
 
@@ -3751,6 +3982,9 @@ function AstWalkCallback(cur_parfor :: PIRParForAst, dw :: DirWalk, top_level_nu
 
     for i = 1:length(cur_parfor.preParFor)
         cur_parfor.preParFor[i] = AstWalk(cur_parfor.preParFor[i], dw.callback, dw.cbdata)
+    end
+    for i = 1:length(cur_parfor.hoisted)
+        cur_parfor.hoisted[i] = AstWalk(cur_parfor.hoisted[i], dw.callback, dw.cbdata)
     end
     for i = 1:length(cur_parfor.loopNests)
         cur_parfor.loopNests[i].indexVariable = AstWalk(cur_parfor.loopNests[i].indexVariable, dw.callback, dw.cbdata)
@@ -3923,6 +4157,7 @@ function pir_alias_cb(ast::Expr, state, cbdata)
 
         AliasAnalysis.increaseNestLevel(state);
         AliasAnalysis.from_exprs(state, this_parfor.preParFor, pir_alias_cb, cbdata)
+        AliasAnalysis.from_exprs(state, this_parfor.hoisted, pir_alias_cb, cbdata)
         AliasAnalysis.from_exprs(state, this_parfor.body, pir_alias_cb, cbdata)
         ret = AliasAnalysis.from_exprs(state, this_parfor.postParFor, pir_alias_cb, cbdata)
         AliasAnalysis.decreaseNestLevel(state);
@@ -3967,7 +4202,7 @@ function dependenceCB(ast::Expr, cbdata)
         end
 
         return CompilerTools.TransitiveDependence.CallbackResult(
-                 CompilerTools.TransitiveDependence.mergeDepSet(
+                 CompilerTools.TransitiveDependence.mergeDepSet(   # FIX FIX FIX...do something here with hoisted???
                    CompilerTools.TransitiveDependence.computeDependenciesAST(TypedExpr(nothing, :body, this_parfor.preParFor...), ParallelAccelerator.ParallelIR.dependenceCB, nothing),
                    CompilerTools.TransitiveDependence.computeDependenciesAST(TypedExpr(nothing, :body, this_parfor.body...), ParallelAccelerator.ParallelIR.dependenceCB, nothing)
                  ),

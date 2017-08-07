@@ -58,8 +58,8 @@ end
 end
 
 function test_At_mul_B(m::Int, k::Int, n::Int)
-    W = Array(Float64, m, k)   
-    X = Array(Float64, m, n)
+    W = Array{Float64}(m, k)   
+    X = Array{Float64}(m, n)
     fill!(W, 3)
     fill!(X, 5)
     opt_At_mul_B!(X, W)
@@ -126,22 +126,22 @@ end
 end
 
 @acc function test8_acc1(a :: Array{Int64, 3})
-    a[:, 1, 1] .+ 2 .* 3
+    a[:, 1, 1] + 2 * 3
 end
 @acc function test8_acc2(a :: Array{Int64, 3})
-    a[1, :, 1] .+ 2 .* 3
+    a[1, :, 1] + 2 * 3
 end
 @acc function test8_acc3(a :: Array{Int64, 3})
-    a[1, 1, :] .+ 2 .* 3
+    a[1, 1, :] + 2 * 3
 end
 @acc function test8_acc4(a :: Array{Int64, 3})
-    a[:, :, 1] .+ 2 .* 3
+    a[:, :, 1] + 2 * 3
 end
 @acc function test8_acc5(a :: Array{Int64, 3})
-    a[:, 1, :] .+ 2 .* 3
+    a[:, 1, :] + 2 * 3
 end
 @acc function test8_acc6(a :: Array{Int64, 3})
-    a[1, :, :] .+ 2 .* 3
+    a[1, :, :] + 2 * 3
 end
 
 function test8()

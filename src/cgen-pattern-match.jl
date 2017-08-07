@@ -40,7 +40,7 @@ function pattern_match_call_math(fun::Symbol, input::AbstractString, typ::Type, 
     end
 
     # abs() needs special handling since fabs() in math.h should be called for floats
-    if is(fun,:abs) && (isFloat || isDouble || isComplex || isInt)
+    if (fun === :abs) && (isFloat || isDouble || isComplex || isInt)
       @dprintln(3,"FOUND ", fun)
       fname = (isInt || isComplex) ? "abs" : (isFloat ? "fabsf" : "fabs")
       s = fname*"("*input*");"
@@ -128,7 +128,7 @@ end
 
 function pattern_match_call_reshape(fun, inp::Any, shape::RHSVar, linfo)
     res = ""
-    if isBaseFunc(fun, :reshape)
+    if isBaseFunc(fun, :reshape) || fun==GlobalRef(ParallelAccelerator.API,:reshape)
         typ = getSymType(shape, linfo)
         if istupletyp(typ)
             dim = length(typ.parameters)
@@ -150,18 +150,26 @@ function getSymType(a, linfo)
     return lstate.symboltable[lookupVariableName(a, linfo)]
 end
 
-function pattern_match_call_gemm(fun::GlobalRef, C::RHSVar, tA::Char, tB::Char, A::RHSVar, B::RHSVar,linfo)
+function pattern_match_call_gemm(fun::GlobalRef, C::RHSVar, tA::Char, tB::Char, A::RHSVar, B::RHSVar, alpha, beta, linfo)
     if fun.mod!=Base.LinAlg || fun.name!=:gemm_wrapper!
         return ""
     end
+    calpha = from_expr(alpha,linfo)
+    cbeta = from_expr(beta,linfo)
     cblas_fun = ""
-    typ = getSymType(A, linfo)
-    if getSymType(B, linfo) != typ || getSymType(C, linfo) != typ
+    a_typ = getSymType(A, linfo)
+    b_typ = getSymType(B, linfo)
+    c_typ = getSymType(C, linfo)
+    if !isArrayType(a_typ) || !isArrayType(b_typ) || !isArrayType(c_typ)
         return ""
     end
-    if typ==Array{Float32,2}
+    typ = eltype(a_typ)
+    if eltype(b_typ) != typ || eltype(c_typ) != typ
+        return ""
+    end
+    if typ==Float32
         cblas_fun = "cblas_sgemm"
-    elseif typ==Array{Float64,2}
+    elseif typ==Float64
         cblas_fun = "cblas_dgemm"
     else
         return ""
@@ -184,8 +192,8 @@ function pattern_match_call_gemm(fun::GlobalRef, C::RHSVar, tA::Char, tB::Char, 
 
 
     if mkl_lib!="" || openblas_lib!="" || sys_blas==1
-        s *= "$(cblas_fun)((CBLAS_ORDER)$(CblasColMajor),(CBLAS_TRANSPOSE)$(_tA),(CBLAS_TRANSPOSE)$(_tB),$m,$n,$k,1.0,
-        $(from_expr(A,linfo)).data, $lda, $(from_expr(B,linfo)).data, $ldb, 0.0, $(from_expr(C,linfo)).data, $ldc)"
+        s *= "$(cblas_fun)((CBLAS_ORDER)$(CblasColMajor),(CBLAS_TRANSPOSE)$(_tA),(CBLAS_TRANSPOSE)$(_tB),$m,$n,$k,$calpha,
+        $(from_expr(A,linfo)).data, $lda, $(from_expr(B,linfo)).data, $ldb, $cbeta, $(from_expr(C,linfo)).data, $ldc)"
     else
         println("WARNING: MKL and OpenBLAS not found. Matrix multiplication might be slow.
         Please install MKL or OpenBLAS and rebuild ParallelAccelerator for better performance.")
@@ -195,7 +203,7 @@ function pattern_match_call_gemm(fun::GlobalRef, C::RHSVar, tA::Char, tB::Char, 
     return s
 end
 
-function pattern_match_call_gemm(fun::ANY, C::ANY, tA::ANY, tB::ANY, A::ANY, B::ANY,linfo)
+function pattern_match_call_gemm(fun::ANY, C::ANY, tA::ANY, tB::ANY, A::ANY, B::ANY,alpha::ANY,beta::ANY,linfo)
     return ""
 end
 
@@ -244,8 +252,8 @@ function pattern_match_call_gemv(fun::ANY, C::ANY, tA::ANY, A::ANY, B::ANY,linfo
     return ""
 end
 
-function pattern_match_call_chol(fun::GlobalRef, A::RHSVar, vUL::Type, linfo)
-    if fun.mod!=Base.LinAlg || fun.name!=:chol!
+function pattern_match_call_chol(fun::GlobalRef, A::RHSVar, linfo)
+    if fun.mod!=Base.LinAlg || fun.name!=:chol
         return ""
     end
 
@@ -260,7 +268,7 @@ function pattern_match_call_chol(fun::GlobalRef, A::RHSVar, vUL::Type, linfo)
         return ""
     end
 
-    s = ".data=$(from_expr(A,linfo)); "
+    s = "$(from_expr(A,linfo)); "
 
     n = from_arraysize(A,1,linfo)
 
@@ -269,7 +277,7 @@ function pattern_match_call_chol(fun::GlobalRef, A::RHSVar, vUL::Type, linfo)
 
 
     LAPACK_COL_MAJOR = 102
-    uplo = vUL==Val{:U} ? 'U' : 'L'
+    uplo = 'U' #vUL==Val{:U} ? 'U' : 'L'
 
 
     if mkl_lib!="" || openblas_lib!="" || sys_blas==1
@@ -284,28 +292,29 @@ function pattern_match_call_chol(fun::GlobalRef, A::RHSVar, vUL::Type, linfo)
     return s
 end
 
-function pattern_match_call_chol(fun::ANY, C::ANY, tA::ANY, linfo)
+function pattern_match_call_chol(fun::ANY, C::ANY, linfo)
     return ""
 end
 
-function pattern_match_assignment_chol(lhs::LHSVar, rhs::Expr, linfo)
-    call = ""
-    if isCall(rhs) || isInvoke(rhs)
-        fun = getCallFunction(rhs)
-        args = getCallArguments(rhs)
-        if length(args) == 2
-            call *= pattern_match_call_chol(fun,args[1],args[2],linfo)
-        end
-    end
-    if call!=""
-        return from_expr(lhs,linfo)*call
-    end
-    return ""
-end
-
-function pattern_match_assignment_chol(lhs::ANY, rhs::ANY, linfo)
-    return ""
-end
+# # 0.4 legacy code not needed anymore
+# function pattern_match_assignment_chol(lhs::LHSVar, rhs::Expr, linfo)
+#     call = ""
+#     if isCall(rhs) || isInvoke(rhs)
+#         fun = getCallFunction(rhs)
+#         args = getCallArguments(rhs)
+#         if length(args) == 2
+#             call *= pattern_match_call_chol(fun,args[1],args[2],linfo)
+#         end
+#     end
+#     if call!=""
+#         return from_expr(lhs,linfo)*call
+#     end
+#     return ""
+# end
+#
+# function pattern_match_assignment_chol(lhs::ANY, rhs::ANY, linfo)
+#     return ""
+# end
 
 function pattern_match_assignment_transpose(lhs::LHSVar, rhs::Expr, linfo)
     @dprintln(3, "pattern_match_assignment_transpose ", lhs, " ", rhs)
@@ -510,6 +519,37 @@ function pattern_match_call_reduce_oprs(fun::ANY, x::ANY, y::ANY,linfo)
     return ""
 end
 
+
+function pattern_match_call_subarray_lastdim(func::GlobalRef, arr::RHSVar, index::Union{Int,RHSVar}, linfo)
+    if func==GlobalRef(ParallelAccelerator.API,:SubArrayLastDimRead) || func==GlobalRef(ParallelAccelerator.API,:SubArrayLastDimWrite)
+        arr_typ = getType(arr, linfo)
+        typ = eltype(arr_typ)
+        ctyp = ParallelAccelerator.CGen.toCtype(typ)
+        dims = ndims(arr_typ)
+        carr = ParallelAccelerator.CGen.from_expr(toLHSVar(arr), linfo)
+        cindex = ParallelAccelerator.CGen.from_expr(toLHSVarOrNum(index), linfo)
+        shape = mapfoldl(i->from_arraysize(arr,i,linfo), (a,b)->a *","*b, 1:dims-1)
+        low_dims_size = mapfoldl(i->from_arraysize(arr,i,linfo), (a,b)->a *"*"*b, 1:dims-1)
+        pointer = "&($carr.data[$low_dims_size*($cindex-1)])"
+        return "j2c_array<$ctyp>::new_j2c_array_$(dims-1)d($pointer, $shape)"
+    end
+    return ""
+end
+
+pattern_match_call_subarray_lastdim(func::ANY, arr, index, linfo) = ""
+
+function pattern_match_call_set_zeros(func::GlobalRef, arr::RHSVar, size, linfo)
+    if func==GlobalRef(ParallelAccelerator.API,:set_zeros)
+        carr = from_expr(toLHSVar(arr), linfo)
+        ctyp = toCtype(eltype(getSymType(arr,linfo)))
+        csize = from_expr(size, linfo)
+        return "memset($carr.data, 0, sizeof($ctyp)*$csize)"
+    end
+    return ""
+end
+
+pattern_match_call_set_zeros(func::ANY, arr::ANY, size, linfo) = ""
+
 function pattern_match_call(ast::Array{Any, 1},linfo)
     @dprintln(3,"pattern matching ",ast)
     s = ""
@@ -518,14 +558,17 @@ function pattern_match_call(ast::Array{Any, 1},linfo)
         s = pattern_match_call_throw(ast[1],ast[2],linfo)
         s *= pattern_match_call_math(ast[1],ast[2],linfo)
         s *= pattern_match_call_linalgtypeof(ast[1],ast[2],linfo)
+        s *= pattern_match_call_chol(ast[1],ast[2],linfo)
     end
 
     if s=="" && (length(ast)==3) # randn! call has 3 args
         #sa*= pattern_match_call_powersq(ast[1],ast[2], ast[3])
+        s *= pattern_match_call_set_zeros(ast[1],ast[2],ast[3],linfo)
         s *= pattern_match_call_reshape(ast[1],ast[2],ast[3],linfo)
         s *= pattern_match_call_transpose(linfo, ast...)
         s *= pattern_match_call_vecnorm(ast[1],ast[2],ast[3],linfo)
         s *= pattern_match_call_reduce_oprs(ast[1],ast[2],ast[3],linfo)
+        s *= pattern_match_call_subarray_lastdim(ast[1],ast[2],ast[3], linfo)
     end
     if s=="" && (length(ast)>=1) # rand can have 1 or more arg
         s *= pattern_match_call_transpose(linfo, ast...)
@@ -539,8 +582,11 @@ function pattern_match_call(ast::Array{Any, 1},linfo)
     # gemm calls have 6 args
     if s=="" && (length(ast)==6)
         s *= pattern_match_call_copy!(linfo, ast...)
-        s *= pattern_match_call_gemm(ast[1],ast[2],ast[3],ast[4],ast[5],ast[6],linfo)
+        s *= pattern_match_call_gemm(ast[1],ast[2],ast[3],ast[4],ast[5],ast[6], 1.0, 0.0, linfo)
         s *= pattern_match_call_trtrs(ast[1],ast[2],ast[3],ast[4],ast[5],ast[6],linfo)
+    end
+    if s=="" && (length(ast)==8)
+        s *= pattern_match_call_gemm(ast[1],ast[2],ast[3],ast[4],ast[5],ast[6], ast[7], ast[8], linfo)
     end
     return s
 end
@@ -566,11 +612,20 @@ function from_assignment_match_hvcat(lhs, rhs::Expr, linfo)
             end
             @assert isa(atyp, DataType) ("hvcat expects the first argument to be a type, but got " * args[1])
             typ = toCtype(atyp)
-            rows = lstate.tupleTable[args[2]]
+            tuple_arg = args[2]
+            if isa(tuple_arg, Tuple)
+                rows = tuple_arg
+            else
+                rows = lstate.tupleTable[tuple_arg]
+            end
             values = args[3:end]
         else
-
-            rows = lstate.tupleTable[args[1]]
+            tuple_arg = args[1]
+            if isa(tuple_arg, Tuple)
+                rows = tuple_arg
+            else
+                rows = lstate.tupleTable[tuple_arg]
+            end
             values = args[2:end]
             atyp, arr_dims = parseArrayType(getSymType(lhs, linfo))
             typ = toCtype(atyp)
@@ -665,22 +720,31 @@ function from_assignment_match_vcat(lhs, rhs::Expr, linfo)
         args = getCallArguments(rhs)
         for a in args
             atyp = getType(a, linfo)
-            @assert atyp<:Array && ndims(atyp)==1 "CGen only supports vcat of 1D arrays"
+            @assert atyp<:Array && (ndims(atyp)==1 || ndims(atyp)==2) "CGen only supports vcat of 1D and 2D arrays"
         end
+        num_dims = ndims(getType(args[1], linfo))
         typ = eltype(getType(args[1], linfo))
         ctyp = toCtype(typ)
         clhs = from_expr(lhs,linfo)
         # get total size of array: size(a1)+size(a2)+...
         csize = "("* mapfoldl(a->from_arraysize(a,1,linfo),(a,b)->"$a+$b",args) *")"
+        c_num_cols = "1"
+        if num_dims==2
+            c_num_cols = from_arraysize(args[1],2,linfo)
+            csize *= ", $c_num_cols"
+        end
         s *= "{\n"
-        s *= "$clhs = j2c_array<$ctyp>::new_j2c_array_1d(NULL, $csize);\n"
-        s *= "  int64_t __cgen_curr_ind = 0;\n"
+        s *= "$clhs = j2c_array<$ctyp>::new_j2c_array_$(num_dims)d(NULL, $csize);\n"
+        s *= "int64_t __cgen_curr_ind = 0;\n"
+        s *= "for(int64_t j=0; j<$c_num_cols; j++){\n"
         for arr in args
             carr = from_expr(arr, linfo)
-            s *= "for(int64_t i=0; i<$(from_arraysize(arr,1,linfo)); i++){\n"
-            s *= "  $clhs.data[__cgen_curr_ind++] = $carr.data[i];\n"
+            col_size = from_arraysize(arr,1,linfo)
+            s *= "for(int64_t i=0; i<$col_size; i++){\n"
+            s *= "  $clhs.data[__cgen_curr_ind++] = $carr.data[j*$col_size+i];\n"
             s *= "}\n"
         end
+        s *= "}\n"
         s *= "}\n"
     end
     return s

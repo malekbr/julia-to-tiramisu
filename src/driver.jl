@@ -34,7 +34,7 @@ using CompilerTools.Helper
 
 import ..ParallelAccelerator, ..Comprehension, ..DomainIR, ..ParallelIR, ..CGen, ..API, ..Tiramisu
 import ..dprint, ..dprintln, ..@dprint, ..@dprintln, ..DEBUG_LVL
-import ..CallGraph.extractStaticCallGraph, ..CallGraph.use_extract_static_call_graph
+#import ..CallGraph.extractStaticCallGraph, ..CallGraph.use_extract_static_call_graph
 using ..J2CArray
 
 # MODE for accelerate
@@ -51,7 +51,7 @@ function convert_to_ccall_typ(typ)
   if isArrayType(typ)
     # If it is an Array type then convert to Ptr type.
     return (Ptr{Void},ndims(typ))
-  elseif is(typ, ())
+  elseif (typ === ())
     return (Void, 0)
   elseif isStringType(typ)
       return (Ptr{UInt8},1)
@@ -157,12 +157,12 @@ function expandParMacro(func, ast, sig)
 end
 
 function extractCallGraph(func :: GlobalRef, ast, signature :: Tuple)
-    if use_extract_static_call_graph != 0
-      callgraph = extractStaticCallGraph(func, ast, signature)
-      @dprintln(3,"Callgraph:")
-      @dprintln(3,callgraph)
-      #throw(string("stop after cb"))
-    end
+#    if use_extract_static_call_graph != 0
+#      callgraph = extractStaticCallGraph(func, ast, signature)
+#      @dprintln(3,"Callgraph:")
+#      @dprintln(3,callgraph)
+#      #throw(string("stop after cb"))
+#    end
     return ast
 end
 
@@ -290,8 +290,8 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
 
   map!(s -> gensym(string(s)), original_args)
   assert(length(original_args) == length(sig_dims))
-  modified_args = Array(Any, length(sig_dims))
-  extra_inits = Array(Any, 0)
+  modified_args = Array{Any}(length(sig_dims))
+  extra_inits = Array{Any}(0)
   j2c_array = gensym("j2c_arr")
 
   j2c_array_new =
@@ -302,7 +302,7 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
     @eval (elem_bytes::Int, inp::Union{Array, Void}, ndim::Int, dims::Tuple) -> begin
       # note that C interface mandates Int64 for dimension data
       _dims = Int64[ convert(Int64, x) for x in dims ]
-      _inp = is(inp, nothing) ? C_NULL : convert(Ptr{Void}, pointer(inp))
+      _inp = (inp === nothing) ? C_NULL : convert(Ptr{Void}, pointer(inp))
 
       #ccall((:j2c_array_new, $dyn_lib), Ptr{Void}, (Cint, Ptr{Void}, Cuint, Ptr{UInt64}),
       #      convert(Cint, elem_bytes), _inp, convert(Cuint, ndim), pointer(_dims))
@@ -335,8 +335,8 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
   end
 
   num_rets = length(ret_typs)
-  ret_arg_exps = Array(Any, 0)
-  extra_sig = Array(Type, 0)
+  ret_arg_exps = Array{Any}(0)
+  extra_sig = Array{Type}(0)
   # We special-case functions that return Void/nothing since it is common.
   Void_return = (num_rets == 1 && ret_typs[1][1] == Void)
   if !Void_return
@@ -363,20 +363,20 @@ function toCGen(func :: GlobalRef, code, signature :: Tuple)
       # ptr_array_dict and will alias to the returned array.
       ptr_array_dict = Dict{Ptr{Void},Array}()
       #@dprintln(2,"Running proxy function.")
-      ret_args = Array(Any, $num_rets)
+      ret_args = Array{Any}($num_rets)
       for i = 1:$num_rets
         (t, is_array) = $(ret_typs)[i]
         if is_array
           t = Ptr{Void}
         end
-        ret_args[i] = Array(t, 1) # hold return result
+        ret_args[i] = Array{t}(1) # hold return result
       end
       $(j2c_array) = [ $(extra_inits...) ]
       #j2c_array_typs = Any[ typeof(x) for x in $(extra_inits...) ]
       #@dprintln(3, "before ccall: ret_args = ", Any[$(ret_arg_exps...)])
       #@dprintln(3, "before ccall: modified_args = ", Any[$(modified_args...)])
       ccall(($j2c_name, $dyn_lib), Void, $tuple_sig_expr, $run_where, $(modified_args...), $(ret_arg_exps...))
-      result = Array(Any, $num_rets)
+      result = Array{Any}($num_rets)
       for i = 1:$num_rets
         (t, is_array) = $(ret_typs)[i]
         dprintln(3, "ret=", ret_args[i][1], "t=", t, " is_array=", is_array)
@@ -442,14 +442,21 @@ end
 function code_typed(func, signature)
   global alreadyOptimized
   if haskey(alreadyOptimized, (func, signature))
-    Any[ alreadyOptimized[(func, signature)] ]
+    @dprintln(3, "func ", func, " is already optimized")
+    return alreadyOptimized[(func, signature)]
   else
     @dprintln(3, "func ", func, " is not already optimized")
     mod = Base.function_module(func, signature)
     name = Base.function_name(func)
     func = eval(CompilerTools.OptFramework.findTargetFunc(mod, name))
     @dprintln(3, "target func is ", func)
-    Base.code_typed(func, signature)
+    ast = Base.code_typed(func, signature)[1]
+    if VERSION >= v"0.6.0-pre"
+        t1 = ast
+        @dprintln(3, "t1 = ", t1, " ", typeof(t1))
+        ast = LambdaInfo(func, signature, t1)
+    end
+    return ast
   end
 end
 
@@ -483,7 +490,7 @@ function accelerate(func::Function, signature::Tuple, level = TOPLEVEL)
   func_ref = GlobalRef(cur_module, Base.function_name(func))
 
   local out
-  ast = code_typed(func, signature)[1]
+  ast = ParallelAccelerator.Driver.code_typed(func, signature)
   global alreadyOptimized
   global seenByMacroPass
 

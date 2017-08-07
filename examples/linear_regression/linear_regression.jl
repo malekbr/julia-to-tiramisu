@@ -26,46 +26,55 @@ THE POSSIBILITY OF SUCH DAMAGE.
 using ParallelAccelerator
 using DocOpt
 
-#ParallelAccelerator.set_debug_level(3)
-#ParallelAccelerator.DomainIR.set_debug_level(3)
-#ParallelAccelerator.CGen.set_debug_level(3)
+@acc function linear_regression(iterations)
+    D = 10  # Number of features
+    N = 10000 # number of instances
+    p = 3 # number of functions
 
-@acc function calcPi(n)
-    x = rand(n) * 2.0 - 1.0
-    y = rand(n) * 2.0 - 1.0
-    return 4.0*sum(x.^2 + y.^2 .< 1.0)/n
+    labels = rand(p,N)
+    points = rand(D,N)
+    w = zeros(p,D)
+    alphaN = 0.01/N
+
+    for i in 1:iterations
+       w -= alphaN*((w*points)-labels)*points' 
+    end
+    w
 end
 
-
 function main()
-    doc = """pi.jl
+    doc = """linear_regression.jl
 
-Estimate Pi using Monte Carlo method.
+linear regression statistical method.
 
 Usage:
-  pi.jl -h | --help
-  pi.jl [--points=<points>]
+  linear_regression.jl -h | --help
+  linear_regression.jl [--iterations=<iterations>]
 
 Options:
-  -h --help          Show this screen.
-  --points=<points>  Specify number of generated random points [default: 10000000].
+  -h --help                  Show this screen.
+  --iterations=<iterations>  Specify a number of iterations [default: 50].
 """
     arguments = docopt(doc)
 
-    points = parse(Int, arguments["--points"])
+    iterations = parse(Int, arguments["--iterations"])
 
-    println("points = ", points)
+    srand(0)
+
+    println("iterations = ",iterations)
 
     tic()
-    calcPi(100)
+    linear_regression(2)
     println("SELFPRIMED ", toq())
 
     tic()
-    pi_val = calcPi(points)
+    W = linear_regression(iterations)
     time = toq()
-    println("pi = ", pi_val)
+    println("result = ", W)
+    println("rate = ", iterations / time, " iterations/sec")
     println("SELFTIMED ", time)
 
 end
 
 main()
+

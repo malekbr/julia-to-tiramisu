@@ -2,35 +2,36 @@
 Copyright (c) 2015, Intel Corporation
 All rights reserved.
 
-Redistribution and use in source and binary forms, with or without 
+Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
-- Redistributions of source code must retain the above copyright notice, 
+- Redistributions of source code must retain the above copyright notice,
   this list of conditions and the following disclaimer.
-- Redistributions in binary form must reproduce the above copyright notice, 
-  this list of conditions and the following disclaimer in the documentation 
+- Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
   and/or other materials provided with the distribution.
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE 
-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF 
-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
 INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) 
-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF 
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 THE POSSIBILITY OF SUCH DAMAGE.
 =#
 
 
-# Process the top-level expressions of a function and do fusion and useless assignment elimination.
+"""
+top_level_mk_body: lower domain nodes in the AST to parfor nodes.
+"""
 function top_level_mk_body(ast::Array{Any,1}, depth, state)
     len  = length(ast)
     body = Any[]
     fuse_number = 1
-    pre_next_parfor = Any[]
-    
+
     # Process the top-level expressions of a function and do fusion and useless assignment elimination.
     for i = 1:len
         # Record the top-level statement number in the processing state.
@@ -38,90 +39,96 @@ function top_level_mk_body(ast::Array{Any,1}, depth, state)
         @dprintln(2,"Processing top-level ast #",i," depth=",depth)
 
         # Convert the current expression.
-#        new_exprs = filter(x->!hasNoSideEffects(x), from_expr(ast[i], depth, state, true))
         new_exprs = from_expr(ast[i], depth, state, true)
         assert(isa(new_exprs,Array))
         # If conversion of current statement resulted in anything.
         if length(new_exprs) != 0
-            # If this isn't the first statement processed that created something.
-            if length(body) != 0
-                last_node = body[end]
-                @dprintln(3, "Should fuse?")
-                @dprintln(3, "new = ", new_exprs[1])
-                @dprintln(3, "last = ", last_node)
-
-                # See if the previous expression is a parfor.
-                is_last_parfor = isParforAssignmentNode(last_node)    || isBareParfor(last_node)
-                # See if the new expression is a parfor.
-                is_new_parfor  = isParforAssignmentNode(new_exprs[1]) || isBareParfor(new_exprs[1])
-                @dprintln(3,"is_new_parfor = ", is_new_parfor, " is_last_parfor = ", is_last_parfor)
-
-if false
-                if is_last_parfor && !is_new_parfor
-                    simple = false
-                    for j = 1:length(new_exprs)
-                        e = new_exprs[j]
-                        if isa(e, Expr) && is(e.head, :(=)) && isa(e.args[2], Expr) && (isBaseFunc(e.args[2].args[1], :box))
-                            @dprintln(3, "box operation detected")
-                            simple = true
-                        else
-                            simple = false
-                            break
-                        end
-                    end
-                    if simple
-                        @dprintln(3, "insert into pre_next_parfor")
-                        append!(pre_next_parfor, new_exprs)
-                        continue
-                    end
-                end
-end
-
-                # If both are parfors then try to fuse them.
-                if is_new_parfor && is_last_parfor
-                    @dprintln(3,"Starting fusion ", fuse_number)
-                    new_exprs[1]
-                    fuse_number = fuse_number + 1
-                    if length(pre_next_parfor) > 0
-                        @dprintln(3, "prepend statements to new parfor: ", pre_next_parfor)
-                        new_parfor = getParforNode(new_exprs[1])
-                        new_parfor.preParFor = [ pre_next_parfor..., new_parfor.preParFor... ]
-                    end
-                    fuse_ret = fuse(body, length(body), new_exprs[1], state)
-                    if fuse_ret>0
-                        # 2 means combination of old and new parfors has no output and both are dead
-                        if fuse_ret==2
-                            # remove last parfor and don't add anything new
-                            pop!(body)
-                        end
-                        pre_next_parfor = Any[]
-                        # If fused then the new node is consumed and no new node is added to the body.
-                        continue
-                    end
-                end
-
-                new_exprs = [ pre_next_parfor; new_exprs ]
-                pre_next_parfor = Any[]
-                for expr in new_exprs
-                    push!(body, expr)
-                    last_node = expr
-                end
-            else
-                append!(body, new_exprs)
-            end
+            append!(body, new_exprs)
         else
             @dprintln(3,"This statement was filtered: ", ast[i])
         end
     end
     return body
-    
+end
+
+"""
+fusion_pass: perform fusion of adjacent parfor nodes in the AST.
+"""
+function fusion_pass(ast::Array{Any,1}, depth, state)
+    len  = length(ast)
+    body = Any[]
+    fuse_number = 1
+
+    # Process the top-level expressions of a function and do fusion and useless assignment elimination.
+    for i = 1:len
+        # Record the top-level statement number in the processing state.
+        state.top_level_number = i
+        @dprintln(2,"Processing top-level ast #",i," depth=",depth)
+
+        # If this isn't the first statement...
+        if length(body) != 0
+            last_node = body[end]  # Get the last statement inserted.
+            @dprintln(3, "Should fuse?")
+            @dprintln(3, "new = ", ast[i])
+            @dprintln(3, "last = ", last_node)
+
+            # See if the previous expression is a parfor.
+            is_last_parfor = isParforAssignmentNode(last_node) || isBareParfor(last_node)
+            # See if the new expression is a parfor.
+            is_new_parfor  = isParforAssignmentNode(ast[i])    || isBareParfor(ast[i])
+            @dprintln(3,"is_new_parfor = ", is_new_parfor, " is_last_parfor = ", is_last_parfor)
+
+            # If both are parfors then try to fuse them.
+            if is_new_parfor && is_last_parfor
+                @dprintln(3,"Starting fusion ", fuse_number)
+                fuse_number = fuse_number + 1
+                fuse_ret = fuse(body, length(body), ast[i], state)
+                if fuse_ret>0
+                    # 2 means combination of old and new parfors has no output and both are dead
+                    if fuse_ret==2
+                        # remove last parfor and don't add anything new
+                        pop!(body)
+                    end
+                    # If fused then the new node is consumed and no new node is added to the body.
+                    continue
+                end
+            end
+
+            push!(body, ast[i])
+        else
+            push!(body, ast[i])
+        end
+    end
+    return body
+end
+
+"""
+fusion_pass: perform fusion on the AST but callable as an external pass.  Just takes the
+function name and function lambda.
+"""
+function fusion_pass(function_name::String, LambdaVarInfo, body::Expr)
+    #LambdaVarInfo, body = CompilerTools.LambdaHandling.lambdaToLambdaVarInfo(ast)
+    @assert body.head==:body "invalid body expr head"
+    max_label = getMaxLabel(0, body.args)
+    lives = computeLiveness(body, LambdaVarInfo)
+    input_arrays = getArrayParams(LambdaVarInfo)
+    state = expr_state(function_name, lives, max_label, input_arrays)
+    genEquivalenceClasses(LambdaVarInfo, body, state)
+    @dprintln(3,"new fusion lambda = ")
+    printLambda(3, LambdaVarInfo, body)
+    @dprintln(3,"new fusion equivalence classes")
+    print_correlations(3, state)
+    body = fusion_pass(body.args, 1, state)
+    body = Expr(:body, body...)
+    # return CompilerTools.LambdaHandling.LambdaVarInfoToLambda(LambdaVarInfo, body, ParallelAccelerator.ParallelIR.AstWalk)
+    return LambdaVarInfo, body
 end
 
 # Remove the pre-statements from parfor nodes and expand them into the top-level expression array.
 function top_level_expand_pre(body, state)
 
     expanded_body = Any[]
-    
+
     for i = 1:length(body)
         if isParforAssignmentNode(body[i])
             parfor_assignment = body[i]
@@ -134,7 +141,9 @@ function top_level_expand_pre(body, state)
 
             # Add all the pre-parfor statements to the expanded body.
             append!(expanded_body, the_parfor.preParFor)
+            append!(expanded_body, the_parfor.hoisted)
             the_parfor.preParFor = Any[]
+            the_parfor.hoisted = Any[]
 
             # Add just the parfor to the expanded body.  The post-parfor part removed below.
             assert(typeof(rhs) == Expr)
@@ -162,7 +171,9 @@ function top_level_expand_pre(body, state)
 
             # Add all the pre-parfor statements to the expanded body.
             append!(expanded_body, the_parfor.preParFor)
+            append!(expanded_body, the_parfor.hoisted)
             the_parfor.preParFor = Any[]
+            the_parfor.hoisted= Any[]
 
             # Add just the parfor to the expanded body.  The post-parfor part removed below.
             assert(typeof(rhs) == Expr)
@@ -344,7 +355,7 @@ function top_level_mk_task_graph(body, state, new_lives, loop_info)
                             cur_start = cur_end = body_indices[j]
                         else
                             cur_end = body_indices[j]
-                        end 
+                        end
                         push!(stmts_in_batch, body_indices[j])
                     else
                         if cur_start != nothing
@@ -518,7 +529,7 @@ function top_level_mk_task_graph(body, state, new_lives, loop_info)
 
                         @dprintln(3,"InsertTaskNode = ", itn)
 
-                        insert_task_expr = TypedExpr(Int, :insert_divisible_task, itn) 
+                        insert_task_expr = TypedExpr(Int, :insert_divisible_task, itn)
                         push!(new_body, insert_task_expr)
                     else
                         throw(string("insert sequential task not implemented yet"))
@@ -561,7 +572,7 @@ function top_level_mk_task_graph(body, state, new_lives, loop_info)
                     atype = Array{getType(this_param, state.LambdaVarInfo), 1}
                     temp_param_array = createStateVar(state, string(this_param.name, "_out_array"), atype, ISASSIGNED)
                     push!(real_out_params, temp_param_array)
-                    new_temp_array = mk_alloc_array_1d_expr(this_param.typ, atype, 1)
+                    new_temp_array = mk_alloc_array_expr(this_param.typ, atype, 1)
                     push!(new_body, mk_assignment_expr(temp_param_array, new_temp_array, state))
                 end
 
@@ -637,14 +648,14 @@ function recreateFromLoophead(new_body, stmt :: Expr, LoopEndDict :: Dict{LHSVar
         recreate_temp_rhsvar   = CompilerTools.LambdaHandling.addLocalVariable(recreate_temp_var   , Int64, ISASSIGNED, newLambdaVarInfo)
         recreate_ssa5_rhsvar   = CompilerTools.LambdaHandling.addLocalVariable(recreate_ssa5_var   , Int64, ISASSIGNED, newLambdaVarInfo)
         recreate_ssa6_rhsvar   = CompilerTools.LambdaHandling.addLocalVariable(recreate_ssa6_var   , Int64, ISASSIGNED, newLambdaVarInfo)
-        
+
         steprange_last_lhsvar  = toLHSVar(steprange_last_rhsvar)
         steprange_first_lhsvar = toLHSVar(steprange_first_rhsvar)
         steprange_step_lhsvar  = toLHSVar(steprange_step_rhsvar)
         recreate_temp_lhsvar   = toLHSVar(recreate_temp_rhsvar)
         recreate_ssa5_lhsvar   = toLHSVar(recreate_ssa5_rhsvar)
         recreate_ssa6_lhsvar   = toLHSVar(recreate_ssa6_rhsvar)
-          
+
         push!(new_body, mk_assignment_expr(deepcopy(steprange_last_lhsvar), Expr(:call, GlobalRef(Base,:steprange_last), deepcopy(loop_start), 1, deepcopy(loop_end)), newLambdaVarInfo))
         push!(new_body, mk_assignment_expr(deepcopy(steprange_first_lhsvar), deepcopy(loop_start), newLambdaVarInfo))
         push!(new_body, mk_assignment_expr(deepcopy(steprange_step_lhsvar), 1, newLambdaVarInfo))
@@ -659,12 +670,12 @@ function recreateFromLoophead(new_body, stmt :: Expr, LoopEndDict :: Dict{LHSVar
 #        push!(new_body, TypedExpr(Any, :call, :println, GlobalRef(Base,:STDOUT), "after label_head"))
 
         push!(new_body, mk_gotoifnot_expr(
-               Expr(:call, GlobalRef(Base, :box), GlobalRef(Base, :Bool), 
+               boxOrNot(GlobalRef(Base, :Bool),
                    Expr(:call, GlobalRef(Base, :not_int),
-                           Expr(:call, GlobalRef(Base, :or_int), 
-                                   Expr(:call, GlobalRef(Base, :and_int), 
-                                           Expr(:call, GlobalRef(Base, :not_int), 
-                                               Expr(:call, GlobalRef(Base, :(===)), deepcopy(steprange_first_rhsvar), deepcopy(steprange_last_rhsvar)) 
+                           Expr(:call, GlobalRef(Base, :or_int),
+                                   Expr(:call, GlobalRef(Base, :and_int),
+                                           Expr(:call, GlobalRef(Base, :not_int),
+                                               Expr(:call, GlobalRef(Base, :(===)), deepcopy(steprange_first_rhsvar), deepcopy(steprange_last_rhsvar))
                                            ),
                                            Expr(:call, GlobalRef(Base, :not_int),
                                                Expr(:call, GlobalRef(Base, :(===)),
@@ -679,8 +690,8 @@ function recreateFromLoophead(new_body, stmt :: Expr, LoopEndDict :: Dict{LHSVar
                                                )
                                            )
                                        ),
-                               Expr(:call, GlobalRef(Base, :(===)), deepcopy(recreate_temp_rhsvar), 
-                                   Expr(:call, GlobalRef(Base, :box), Int64, Expr(:call, GlobalRef(Base, :add_int), deepcopy(steprange_last_rhsvar), deepcopy(steprange_step_rhsvar))) 
+                               Expr(:call, GlobalRef(Base, :(===)), deepcopy(recreate_temp_rhsvar),
+                                   boxOrNot(Int64, Expr(:call, GlobalRef(Base, :add_int), deepcopy(steprange_last_rhsvar), deepcopy(steprange_step_rhsvar)))
                                )
                            )
                    )
@@ -688,7 +699,7 @@ function recreateFromLoophead(new_body, stmt :: Expr, LoopEndDict :: Dict{LHSVar
                , label_end))
 
         push!(new_body, mk_assignment_expr(deepcopy(recreate_ssa5_lhsvar), deepcopy(recreate_temp_rhsvar), newLambdaVarInfo))
-        push!(new_body, mk_assignment_expr(deepcopy(recreate_ssa6_lhsvar), Expr(:call, GlobalRef(Base, :box), Int64, Expr(:call, GlobalRef(Base, :add_int), deepcopy(recreate_temp_rhsvar), deepcopy(steprange_step_rhsvar))), newLambdaVarInfo))
+        push!(new_body, mk_assignment_expr(deepcopy(recreate_ssa6_lhsvar), boxOrNot(Int64, Expr(:call, GlobalRef(Base, :add_int), deepcopy(recreate_temp_rhsvar), deepcopy(steprange_step_rhsvar))), newLambdaVarInfo))
         push!(new_body, mk_assignment_expr(CompilerTools.LambdaHandling.toLHSVar(deepcopy(loop_id), newLambdaVarInfo), deepcopy(recreate_ssa5_rhsvar), newLambdaVarInfo))
         push!(new_body, mk_assignment_expr(deepcopy(recreate_temp_lhsvar), deepcopy(recreate_ssa6_rhsvar), newLambdaVarInfo))
 
@@ -697,7 +708,7 @@ function recreateFromLoophead(new_body, stmt :: Expr, LoopEndDict :: Dict{LHSVar
         push!(for_loop_end, GotoNode(label_head))
         push!(for_loop_end, LabelNode(label_end))
 
-        LoopEndDict[loop_id] = for_loop_end    
+        LoopEndDict[loop_id] = for_loop_end
     else
 
         label_after_first_unless   = next_label(state)
@@ -721,11 +732,11 @@ function recreateFromLoophead(new_body, stmt :: Expr, LoopEndDict :: Dict{LHSVar
         gensym3_rhsvar  = CompilerTools.LambdaHandling.addLocalVariable(gensym3_sym, Int64, ISASSIGNED, newLambdaVarInfo)
         gensym4_rhsvar  = CompilerTools.LambdaHandling.addLocalVariable(gensym4_sym, Int64, ISASSIGNED, newLambdaVarInfo)
 
-        gensym2_lhsvar  = toLHSVar(gensym2_rhsvar) 
-        gensym0_lhsvar  = toLHSVar(gensym0_rhsvar) 
+        gensym2_lhsvar  = toLHSVar(gensym2_rhsvar)
+        gensym0_lhsvar  = toLHSVar(gensym0_rhsvar)
         pound_s1_lhsvar = toLHSVar(pound_s1_rhsvar)
-        gensym3_lhsvar  = toLHSVar(gensym3_rhsvar) 
-        gensym4_lhsvar  = toLHSVar(gensym4_rhsvar) 
+        gensym3_lhsvar  = toLHSVar(gensym3_rhsvar)
+        gensym4_lhsvar  = toLHSVar(gensym4_rhsvar)
 
         #push!(new_body, TypedExpr(Any, :call, :println, GlobalRef(Base,:STDOUT), "ranges = ", toRHSVar(:ranges, pir_range_actual, state.LambdaVarInfo)))
         #push!(new_body, TypedExpr(Any, :call, :println, GlobalRef(Base,:STDOUT), "this_nest.lower = ", this_nest.lower))
@@ -752,7 +763,7 @@ function recreateFromLoophead(new_body, stmt :: Expr, LoopEndDict :: Dict{LHSVar
         push!(for_loop_end, LabelNode(label_after_second_unless))
     #    push!(for_loop_end, LabelNode(label_last))
 
-        LoopEndDict[loop_id] = for_loop_end    
+        LoopEndDict[loop_id] = for_loop_end
     end
 
     return nothing
@@ -774,7 +785,7 @@ function process_cur_task(cur_task::TaskInfo, new_body, state)
     range_sym = Symbol(range_var)
     range_rhsvar = CompilerTools.LambdaHandling.addLocalVariable(range_sym, pir_range_actual, CompilerTools.LambdaHandling.ISASSIGNED, state.LambdaVarInfo)
     range_lhsvar = toLHSVar(range_rhsvar)
-    
+
     run_task_directly = haskey(ENV,"PROSPECT_RUN_TASK_DIRECTLY") || (state.in_nested && run_nested_task_directly)
     @dprintln(3,"run_task_directly = ", run_task_directly, " state.in_nested = ", state.in_nested, " run_nested_task_directly = ", run_nested_task_directly)
 
@@ -851,7 +862,7 @@ function process_cur_task(cur_task::TaskInfo, new_body, state)
 #            if haskey(ENV,"PROSPECT_CALL_DYNAMIC_CHECK")
                 push!(new_body, mk_assignment_expr(deepcopy(red_array_lhsvar), Expr(:call, GlobalRef(ParallelAccelerator.ParallelIR, :red_alloc), Any, TypedExpr(Int, :call, GlobalRef(Base.Threads, :nthreads)), Expr(:call, GlobalRef(Core, :tuple), red_var_rhsvars...)), state))
 #            else
-#                push!(new_body, mk_assignment_expr(deepcopy(red_array_lhsvar), mk_alloc_array_1d_expr(Any, Array{Any,1}, TypedExpr(Int, :call, GlobalRef(Base.Threads, :nthreads))), state))
+#                push!(new_body, mk_assignment_expr(deepcopy(red_array_lhsvar), mk_alloc_array_expr(Any, Array{Any,1}, TypedExpr(Int, :call, GlobalRef(Base.Threads, :nthreads))), state))
 #            end
 
             red_output_tuple_typ = Tuple{cur_task.ret_types...}
@@ -940,9 +951,9 @@ function process_cur_task(cur_task::TaskInfo, new_body, state)
         if cur_task.ret_types != Void
             if run_task_directly || haskey(ENV,"PROSPECT_CALL_ISF")
                 for l = 1:red_len
-                    push!(new_body, 
+                    push!(new_body,
                       mk_assignment_expr(
-                        deepcopy(cur_task.reduction_vars[l].name), 
+                        deepcopy(cur_task.reduction_vars[l].name),
                         TypedExpr(cur_task.ret_types[l], :call, GlobalRef(Core, :typeassert),
                             Expr(:call, GlobalRef(Base, :getfield), TypedExpr(red_output_tuple_typ, :call, GlobalRef(Base, :arrayref), deepcopy(red_array_lhsvar), TypedExpr(Int, :call, GlobalRef(Base.Threads,:threadid))), l), cur_task.ret_types[l]), state))
 #                    push!(new_body, TypedExpr(Any, :call, :println, GlobalRef(Base,:STDOUT), "index threadid of red_array = ", deepcopy(cur_task.reduction_vars[l].name)))
@@ -955,7 +966,7 @@ function process_cur_task(cur_task::TaskInfo, new_body, state)
                 # After the jl_threading_run call, we store the first element of the reduction array into their destinations.
                 for l = 1:red_len
                     push!(new_body, mk_assignment_expr(
-                                       deepcopy(cur_task.reduction_vars[l].name), 
+                                       deepcopy(cur_task.reduction_vars[l].name),
                                        TypedExpr(cur_task.ret_types[l], :call, GlobalRef(Core, :typeassert),
                                          Expr(:call, GlobalRef(Base, :getfield), TypedExpr(red_output_tuple_typ, :call, GlobalRef(Base, :arrayref), deepcopy(red_array_lhsvar), 1), l), cur_task.ret_types[l]), state))
 #                    push!(new_body, TypedExpr(Any, :call, :println, GlobalRef(Base,:STDOUT), "index 1 of red_array = ", deepcopy(cur_task.reduction_vars[l].name)))
@@ -964,15 +975,15 @@ function process_cur_task(cur_task::TaskInfo, new_body, state)
                 push!(new_body, Expr(:loophead, deepcopy(red_loop_index_lhsvar), 2, TypedExpr(Int, :call, GlobalRef(Base, :arraylen), deepcopy(red_array_lhsvar))))
                 for l = 1:red_len
                     @dprintln(3, "reduction_vars[l] = ", cur_task.reduction_vars[l])
-                    reduction_code = callDelayedFuncWith(cur_task.join_func[l].reductionFunc, 
-                                                    deepcopy(cur_task.reduction_vars[l].name), 
+                    reduction_code = callDelayedFuncWith(cur_task.join_func[l].reductionFunc,
+                                                    deepcopy(cur_task.reduction_vars[l].name),
                                                     TypedExpr(cur_task.ret_types[l], :call, GlobalRef(Core, :typeassert),
                                                       Expr(:call, GlobalRef(Base, :getfield), TypedExpr(red_output_tuple_typ, :call, GlobalRef(Base, :arrayref), deepcopy(red_array_lhsvar), deepcopy(red_loop_index_lhsvar)), l), cur_task.ret_types[l]))
                     @dprintln(3, "Adding reduction code for reduction variable ", l, " with ", length(reduction_code), " statements.")
 
                     for stmt in reduction_code
                         @dprintln(3, "reduction stmt = ", stmt)
-                        if isBareParfor(stmt) 
+                        if isBareParfor(stmt)
                             @dprintln(3, "reduction stmt is parfor so recreating loops")
                             recreateLoops(new_body, stmt.args[1], state, state.LambdaVarInfo)
                         else
@@ -1017,17 +1028,22 @@ end
 # sequence of expressions
 # ast = [ expr, ... ]
 function top_level_from_exprs(ast::Array{Any,1}, depth, state)
+    # Perform lowering from domain nodes to parfors.
     main_proc_start = time_ns()
-    
     body = top_level_mk_body(ast, depth, state)
-
+    @dprintln(3,"Body after lowering but before fusion.")
+    printBody(3, body)
     if print_times
-    @dprintln(1,"Main parallel conversion loop time = ", ns_to_sec(time_ns() - main_proc_start))
+    @dprintln(1,"Lowering time = ", ns_to_sec(time_ns() - main_proc_start))
     end
 
+    # Perform fusion.
+    fusion_start = time_ns()
+    body = fusion_pass(body, depth, state)
     @dprintln(3,"Body after first pass before task graph creation.")
-    for j = 1:length(body)
-        @dprintln(3, body[j])
+    printBody(3, body)
+    if print_times
+    @dprintln(1,"Fusion time = ", ns_to_sec(time_ns() - fusion_start))
     end
 
     # TASK GRAPH
@@ -1068,9 +1084,9 @@ function top_level_from_exprs(ast::Array{Any,1}, depth, state)
 
     @dprintln(3,"body after mk_task_graph = ")
     printBody(3, body)
-    
+
     expanded_body = Any[]
-    
+
     max_label   = getMaxLabel(0, body)
     LoopEndDict = Dict{LHSVar,Array{Any,1}}()
 
@@ -1078,7 +1094,7 @@ function top_level_from_exprs(ast::Array{Any,1}, depth, state)
         @dprintln(3,"Flatten index ", i, " ", body[i], " type = ", typeof(body[i]))
             # Convert loophead and loopend into Julia loops.
         if ParallelAccelerator.getPseMode() == ParallelAccelerator.THREADS_MODE &&
-            typeof(body[i]) == Expr && 
+            typeof(body[i]) == Expr &&
             (body[i].head == :loophead || body[i].head == :loopend)
             recreateFromLoophead(expanded_body, body[i], LoopEndDict, state, state.LambdaVarInfo)
         else
@@ -1086,7 +1102,7 @@ function top_level_from_exprs(ast::Array{Any,1}, depth, state)
         end
     end
 
-    body = expanded_body 
+    body = expanded_body
     # CompilerTools.OptFramework.cleanupBodyLabels(expanded_body)
     return body
 end
