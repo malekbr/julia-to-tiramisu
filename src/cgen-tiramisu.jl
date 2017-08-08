@@ -25,7 +25,7 @@ using CompilerTools.Helper
 DebugMsg.init()
 
 using ..ParallelAccelerator
-include("tiramisu_prepass.jl")
+include("tiramisu-prepass.jl")
 
 export tiramisu_from_root_entry, tcanonicalize
 

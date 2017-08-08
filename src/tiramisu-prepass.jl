@@ -3,14 +3,15 @@ export detector
 
 SupportedNode = Union{LabelNode, GotoNode, Expr, NewvarNode, LineNumberNode}
 
-# Return the first match
-type AnyOf
-  matchers::Function
+type Future
+  matcher::Function
 end
 
-Matcher = Union{Function, AnyOf}
+Matcher = Union{Function, Future}
 
-# A matcher takes two variables:
+
+
+# A matcher takes three variables:
 # - An expression::Expr
 # - The index of the expression in the top level of the AST
 # - A state (doesn't matter in the first matcher)
@@ -52,6 +53,15 @@ function onlyLabelNode(f::Function)
   end
 end
 
+function onlyGotoNode(f::Function)
+  return function(node::SupportedNode, index::Integer, state::State)
+    if !(typeof(node) <: GotoNode)
+      return false, NoState()
+    end
+    return f(node, index, state)
+  end
+end
+
 function onlyExprB(f::Function)
   return function(node::SupportedNode, index::Integer, state::State)
     if !(typeof(node) <: Expr)
@@ -80,21 +90,35 @@ function onlyGotoNodeB(f::Function)
 end
 
 type ForLoopData <: State
-  from::Integer # lower bound of loop
-  to::Integer # upper bound of loop
-  protec_to::SSAValue # Computed upper bound of loop
+  id::Union{Void, Integer} # assigned id
+  from::Union{Void, Integer} # lower bound of loop
+  to::Union{Void, Integer} # upper bound of loop
+  protec_to::Union{Void, SSAValue} # Computed upper bound of loop
   loop_var::Union{Void, SlotNumber} # Actual loop variable
   used_loop_var::Union{Void, SlotNumber} # Exposed loop variable (if variable is used)
   begin_label::Union{Void, Int64} # Label for reloop
+  cont_label::Union{Void, Int64} # Label for continue
   end_label::Union{Void, Int64} # Label to end loop
   temp_loop_var::Union{Void, SSAValue} # In case of used_loop_var, original value stored here
   inc_loop_var::Union{Void, SSAValue} # In case of used_loop_var, original value stored here
-  header_index::Integer # Index of loop header
-  top_index::Integer
-  bottom_index::Integer # Index of Goto at loop end
+  header_index::Union{Void, Integer} # Index of loop header
+  top_index::Union{Void, Integer}
+  bottom_index::Union{Void, Integer} # Index of Goto at loop end
 end
 
-isForLoopHeader = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
+isForLoopMeta = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
+  is_valid = expr.head === :meta && expr.args[1] === :forloop
+
+  if is_valid
+    state = ForLoopData(repeated(nothing, length(fieldnames(ForLoopData)))...)
+    state.id = expr.args[2]
+    state.header_index = index
+    return true, state
+  end
+  return false, NoState()
+end)
+
+isForLoopHeader = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
   is_valid = (expr.head === :(=))
 
   if !is_valid
@@ -150,11 +174,12 @@ isForLoopHeader = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
                sub_expr.args[3] === 1)
 
   if is_valid
-    state = ForLoopData(from, to, expr.args[1], nothing, nothing, nothing,
-                        nothing, nothing, nothing, index, 0, 0)
-    return true, state
+    state.from = from
+    state.to = to
+    state.protec_to = expr.args[1]
   end
-  return false, NoState()
+
+  return is_valid, state
 end)
 
 isForLoopVarInit = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
@@ -308,17 +333,19 @@ function forLoopHeaderValidator(state::ForLoopData, ast::Expr)
   for (i, expr) in enumerate(ast.args)
     # order is important
     if (isForLoopEndGoto(expr, i,  state) &&
+        isForLoopContLabel(ast.args[i - 1], i - 1,  state) &&
         isForLoopEndLabel(ast.args[i + 1], i + 1, state))
       union!(for_loop_changer.ignore,
              Set((state.header_index + 1):state.top_index))
+      push!(for_loop_changer.ignore, state.bottom_index - 1)
       push!(for_loop_changer.ignore, state.bottom_index + 1)
       for_loop_changer.changers[state.header_index] = function()
-        return Expr(:for_loop_start, state.protec_to,
+        return Expr(:for_loop_start, state.id,
                     state.from, state.to, 1,
                     state.loop_var, state.used_loop_var)
       end
       for_loop_changer.changers[state.bottom_index] = function()
-        return Expr(:for_loop_end, state.protec_to)
+        return Expr(:for_loop_end, state.id)
       end
       break
     end
@@ -333,71 +360,215 @@ isForLoopEndGoto = onlyGotoNodeB(function(expr::GotoNode, index::Integer, state:
   return is_valid
 end)
 
+isForLoopContLabel = onlyLabelNodeB(function(expr::LabelNode, index::Integer, state::ForLoopData)
+  state.cont_label = expr.label
+  return true
+end)
+
 isForLoopEndLabel = onlyLabelNodeB(function(expr::LabelNode, index::Integer, state::ForLoopData)
   return state.end_label == expr.label
 end)
-#### Basic detector
 
-# for_loop_header_pattern = Pattern([onlyExpr(isForLoopHeaderSLE),
-#                                    onlyExpr(isForLoopHeaderSubInt),
-#                                    onlyExpr(isForLoopHeaderSelect),
-#                                    onlyExpr(isForLoopHeaderAddInt)],
-#                                   forLoopHeaderValidator)
+type IfData <: State
+  id::Union{Void, Integer}
+  condition::Any
+  changer::Changer
+end
 
-for_loop_used_pattern = Pattern([isForLoopHeader,
+isIfMeta = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
+  is_valid = expr.head === :meta && expr.args[1] === :if
+  if is_valid
+    state = IfData(expr.args[2], nothing, Changer(Set(), Dict()))
+    push!(state.changer.ignore, index)
+  end
+  return is_valid, state
+end)
+
+isIfGotoIfNot = Future(onlyExpr(function(expr::Expr, index::Integer, state::IfData)
+  is_valid = expr.head === :gotoifnot
+  if is_valid
+    state.condition = expr.args[1]
+    state.changer.changers[index] = () -> Expr(:if, state.id, state.condition)
+  end
+  return is_valid, state
+end))
+
+if_changer = Changer(Set(), Dict())
+
+function ifValidator(state::IfData, ast::Expr)
+  union!(if_changer.ignore, state.changer.ignore)
+  merge!(if_changer.changers, state.changer.changers)
+end
+
+type ContinueData <: State
+  id::Union{Void, Integer}
+  changer::Changer
+end
+
+isContinueMeta = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
+  is_valid = expr.head === :meta && expr.args[1] === :continue
+  if is_valid
+    state = ContinueData(expr.args[2], Changer(Set(), Dict()))
+    state.changer.changers[index] = () -> Expr(:continue, state.id)
+  end
+  return is_valid, state
+end)
+
+isContinueGoto = onlyGotoNode(function(expr::GotoNode, index::Integer, state::ContinueData)
+  push!(state.changer.ignore, index)
+  return true, state
+end)
+
+continue_changer = Changer(Set(), Dict())
+
+function continueValidator(state::ContinueData, ast::Expr)
+  union!(continue_changer.ignore, state.changer.ignore)
+  merge!(continue_changer.changers, state.changer.changers)
+end
+
+type EndifData <: State
+  id::Union{Void, Integer}
+  changer::Changer
+end
+
+isEndifMeta = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
+  is_valid = expr.head === :meta && expr.args[1] === :endif
+  if is_valid
+    state = EndifData(expr.args[2], Changer(Set(), Dict()))
+    state.changer.changers[index] = () -> Expr(:endif, state.id)
+  end
+  return is_valid, state
+end)
+
+isEndifLabel = onlyLabelNode(function(expr::LabelNode, index::Integer, state::EndifData)
+  push!(state.changer.ignore, index)
+  return true, state
+end)
+
+endif_changer = Changer(Set(), Dict())
+
+function endifValidator(state::EndifData, ast::Expr)
+  union!(endif_changer.ignore, state.changer.ignore)
+  merge!(endif_changer.changers, state.changer.changers)
+end
+
+type ElseData <: State
+  id::Union{Void, Integer}
+  changer::Changer
+end
+
+isElseGoto = onlyGotoNode(function(expr::GotoNode, index::Integer, state::NoState)
+  state = ElseData(nothing, Changer(Set(), Dict()))
+  push!(state.changer.ignore, index)
+  return true, state
+end)
+
+isElseLabel = onlyLabelNode(function(expr::LabelNode, index::Integer, state::ElseData)
+  push!(state.changer.ignore, index)
+  return true, state
+end)
+
+isElseMeta = onlyExpr(function(expr::Expr, index::Integer, state::ElseData)
+  is_valid = expr.head === :meta && expr.args[1] === :else
+  if is_valid
+    state.id = expr.args[2]
+    state.changer.changers[index] = () -> Expr(:else, state.id)
+  end
+  return is_valid, state
+end)
+
+else_changer = Changer(Set(), Dict())
+
+function elseValidator(state::ElseData, ast::Expr)
+  union!(else_changer.ignore, state.changer.ignore)
+  merge!(else_changer.changers, state.changer.changers)
+end
+###########
+
+for_loop_used_pattern = Pattern([isForLoopMeta,
+                                 isForLoopHeader,
+                                 isForLoopVarInit,
+                                 isForLoopBeginLabel,
+                                 isForLoopTestGoto,
+                                 isForLoopVarSave,
+                                 isForLoopVarInc,
+                                 isForLoopUsedVar,
+                                 isForLoopUpdateVar], forLoopHeaderValidator)
+
+for_loop_unused_pattern = Pattern([isForLoopMeta,
+                                   isForLoopHeader,
                                    isForLoopVarInit,
                                    isForLoopBeginLabel,
                                    isForLoopTestGoto,
-                                   isForLoopVarSave,
-                                   isForLoopVarInc,
-                                   isForLoopUsedVar,
-                                   isForLoopUpdateVar], forLoopHeaderValidator)
-
-for_loop_unused_pattern = Pattern([isForLoopHeader,
-                                   isForLoopVarInit,
-                                   isForLoopBeginLabel,
-                                   isForLoopTestGoto,
                                    isForLoopVarInc,
                                    isForLoopUpdateVar], forLoopHeaderValidator)
+if_pattern = Pattern([isIfMeta, isIfGotoIfNot], ifValidator)
 
-for_loop_patterns = [for_loop_used_pattern, for_loop_unused_pattern] #, for_loop_test_pattern]
+continue_pattern = Pattern([isContinueMeta, isContinueGoto], continueValidator)
+
+endif_pattern = Pattern([isEndifMeta, isEndifLabel], endifValidator)
+
+else_pattern = Pattern([isElseGoto, isElseLabel, isElseMeta], elseValidator)
+
+patterns = [for_loop_used_pattern, for_loop_unused_pattern, if_pattern,
+            continue_pattern, endif_pattern, else_pattern] #, for_loop_test_pattern]
+
+changers = [for_loop_changer, if_changer, continue_changer, endif_changer,
+            else_changer]
 
 function detector(ast::Expr)
   remove_unused!(ast)
-  detector(ast, for_loop_patterns)
-  ast.args = change(ast, [for_loop_changer])
+  detector(ast, patterns)
+  change!(ast, changers)
 end
 
-first_else(iter, e) = isempty(iter) ? e : first(iter)
+function change!(ast::Expr, changers::Vector{Changer})
+  new_args = Vector{Any}()
+  for (i, e) in enumerate(ast.args)
+    ignore = any(i in c.ignore for c in changers)
+    new_nodes = [c.changers[i]() for c in changers if haskey(c.changers, i)]
+    # TODO store level from pretag, sort changers by level, asc or descending
+    new_args = vcat(new_args, new_nodes)
 
-function change(ast::Expr, changers::Vector{Changer})
-  # I heard you like functional programming, so...
-  return [first_else((c.changers for c in changers if haskey(c.changers, i)),
-                         Dict(i => () -> e))[i]()
-          for (i, e) in enumerate(ast.args)
-          if !any(i in c.ignore for c in changers)]
+    if !ignore && isempty(new_nodes)
+      push!(new_args, e)
+    end
+  end
+  ast.args = new_args
+end
+
+function call_matcher(f::Function, params)
+  return f(params...)..., false
+end
+
+function call_matcher(f::Future, params)
+  return f.matcher(params...)..., true
 end
 
 function detector(ast::Expr, patterns::Vector{Pattern})
   states = State[NoState() for state in patterns]
   indices = [1 for expr in patterns]
   for (e_i, expr) in enumerate(ast.args)
+    if isa(expr, LineNumberNode)
+      continue
+    end
     for (p_i, pattern) in enumerate(patterns)
       @label pattern_check
-      matched, state = pattern.matchers[indices[p_i]](expr, e_i, states[p_i])
+      matched, state, future = call_matcher(pattern.matchers[indices[p_i]],
+                                            (expr, e_i, states[p_i]))
       if matched
         if indices[p_i] == length(pattern.matchers)
           # pattern matched!
           pattern.validator(state, ast)
-          states = State[NoState() for expr in ast.args]
-          indices = [1 for expr in ast.args]
-          break
+
+          states[p_i] = NoState()
+          indices[p_i] = 1
         else
           # pattern not matched yet
           indices[p_i] += 1
           states[p_i] = state
         end
-      else
+      elseif !future
         restart_pattern = indices[p_i] > 1
         indices[p_i] = 1
         states[p_i] = NoState()

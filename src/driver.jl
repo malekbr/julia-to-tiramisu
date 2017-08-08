@@ -25,14 +25,14 @@ THE POSSIBILITY OF SUCH DAMAGE.
 
 module Driver
 
-export accelerate, toDomainIR, toParallelIR, toFlatParfors, toJulia, toCGen, toTiramisu, toCartesianArray, runStencilMacro, captureOperators, expandParMacro, extractCallGraph
+export accelerate, toDomainIR, toParallelIR, toFlatParfors, toJulia, toCGen, toTiramisu, toCartesianArray, runStencilMacro, captureOperators, expandParMacro, extractCallGraph, tiramisuPretag
 
 using CompilerTools
 using CompilerTools.AstWalker
 using CompilerTools.LambdaHandling
 using CompilerTools.Helper
 
-import ..ParallelAccelerator, ..Comprehension, ..DomainIR, ..ParallelIR, ..CGen, ..API, ..Tiramisu
+import ..ParallelAccelerator, ..Comprehension, ..DomainIR, ..ParallelIR, ..CGen, ..API, ..Tiramisu, ..TiramisuPretag
 import ..dprint, ..dprintln, ..@dprint, ..@dprintln, ..DEBUG_LVL
 #import ..CallGraph.extractStaticCallGraph, ..CallGraph.use_extract_static_call_graph
 using ..J2CArray
@@ -115,6 +115,14 @@ alreadyOptimized = Dict{Tuple{Function,Tuple},Any}()
 # the ParallelAccelerator macro passes.  Then, in the domain IR pass, we check if the macro passes saw the
 # function/signature and if not then throw an error.
 seenByMacroPass = Set()
+
+"""
+Adds meta tags that help do transformations later.
+"""
+function tiramisuPretag(func, ast, sig)
+  AstWalk(ast, TiramisuPretag.process_node, nothing)
+  return ast
+end
 
 """
 A pass that translates supported operators and function calls to

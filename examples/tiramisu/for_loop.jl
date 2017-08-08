@@ -13,8 +13,20 @@ using ParallelAccelerator
   # return t
   t = 0
   for i=1:5
+    if i == 2
+      continue
+    end
     for j=7:9
       t = t + i + j
+      if i == 3
+        t += 5
+      elseif j + i == 3
+        continue
+      elseif i == 4
+        t += 2
+      else
+        t += 1
+      end
     end
   end
   k = 0
