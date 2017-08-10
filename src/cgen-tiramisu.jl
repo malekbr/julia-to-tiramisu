@@ -25,7 +25,8 @@ using CompilerTools.Helper
 DebugMsg.init()
 
 using ..ParallelAccelerator
-include("tiramisu-prepass.jl")
+
+importall Base
 
 export tiramisu_from_root_entry, tcanonicalize
 
@@ -64,7 +65,16 @@ jToT = Dict(
 Primitive = Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64,
                   Float16, Float32, Float64, Bool}
 
-Variable = Union{SlotNumber, SSAValue}
+
+# Get type used by arch (Int32 or Int64)
+IntArch = typeof(1)
+
+# Generated slot
+type GenSlot
+    id::IntArch
+end
+
+Variable = Union{SlotNumber, SSAValue, GenSlot}
 
 # TODO : multiple computations per variable for SlotNumber
 
@@ -149,7 +159,7 @@ end
 
 type TComputation
     #computation S0("[N]->{S0[i,j]: 0<=i<N and 0<=j<N}", e3, true, p_uint8, &function0);
-    name::String
+    id::Integer
     conditions::Array{ISLCondition}
     dim::Unsigned
     expr::TExpr
@@ -201,12 +211,13 @@ vars = Dict{Variable, JVar}()
 
 idToBufferName(id::SSAValue) = "BSSA" * string(id.id)
 idToBufferName(id::SlotNumber) = "BSN" * string(id.id)
+idToBufferName(id::GenSlot) = "BGS" * string(id.id)
 
 typToTBuffer = Dict(
-    Int64 => function(id, typ)
+    IntArch => function(id, typ)
         return TBuffer(idToBufferName(id),
-                       [TValue("", 1, Int64)],
-                       Int64,
+                       [TValue("", 1, IntArch)],
+                       IntArch,
                        TBTemporary,
                        true)
     end,
@@ -220,55 +231,74 @@ function make_counter()
     end
 end
 
-computation_counter = make_counter()
-new_computation_id() = "S"*string(computation_counter())
+new_computation_id = make_counter()
 
-function parseExpr(expr::Expr)
-    return exprHandlers[expr.head](expr)
+genslot_counter = make_counter()
+new_genslot() = GenSlot(genslot_counter())
+
+function parseNode(node::Expr)
+    return exprHandlers[node.head](node)
 end
 
-function parseComputation(expr::Primitive)
+function parseNode(node::Variable)
+    # TODO does this always work???
+    if !haskey(vars, node)
+        throw(UndefVarError(Symbol(node)))
+    end
+    # TODO: Indexing should not be done here
+    return TRead(vars[node], [TConstIndex(0)])
+end
+
+function parseNode(node::Primitive)
+    return TValue("", node, typeof(node))
+end
+
+function parseNode(expr::Any)
+    println("Unsupported: ", typeof(expr))
+end
+
+# parsing a computation should be idem potent
+function parseComputation(expr::TComputation, typ::DataType)
+    println("Parsing a computation, should I be?")
+    assert(expr.typ === typ)
+    return expr
+end
+
+function parseComputation(expr::TExpr, typ::DataType)
     return TComputation(
         new_computation_id(),
         [ISLCondition("i", "=", "0")],
         1,
-        getRHS(expr),
-        typeof(expr),
+        expr,
+        typ,
         false # TODO : fix
     )
 end
 
-function getRHS(node::Primitive)
-    return TValue("", node, typeof(node))
+function typedOp!(op::TOp, typ::DataType)
+    op.typ = typ
+    return op
 end
 
-function getRHS(node::Variable)
-    if !haskey(vars, node)
-        throw(UndefVarError(Symbol(node)))
-    end
-    return TRead(vars[node], [TConstIndex(0)])
-end
++(a::TExpr, b::TExpr) = TOp("", "+", TOpInfix, [a, b], Void)
 
+wrap(val::TExpr) = val
+
+wrap(val::Union{Primitive, Variable}) = parseNode(val)
+
+function wrap(val::Any)
+    # Shouldn't have nested calls
+    print_with_color(:yellow, "Trying to wrap:\n")
+    dump(val)
+    return wrap
+end
 
 callHandlers = Dict(
-    (Core.Intrinsics, :add_int) => function(args, typ)
-        return TComputation(
-            new_computation_id(),
-            [ISLCondition("i", "=", "0")],
-            1,
-            TOp(
-                "",
-                "+",
-                TOpInfix,
-                [getRHS(arg) for arg in args],
-                typ
-            ),
-            typ,
-            false # TODO : fix
-        )
+    (Core.Intrinsics, :add_int) => function(args::Vector, typ::DataType)
+        return typedOp!(+(map(wrap, args)...), typ)
     end,
-    (Core.Intrinsics, :box) => function(args, typ)
-        return parseExpr(args[2])
+    (Core.Intrinsics, :box) => function(args::Vector, typ::DataType)
+        return parseNode(args[2])
     end
 )
 
@@ -277,11 +307,10 @@ function handleReturn(arg::Variable, typ::DataType)
 end
 
 function handleReturn(arg, typ::DataType)
-    id = SSAValue(length(vars))
+    id = new_genslot()
     buffer = typToTBuffer[typ](id, typ)
     buffer.argument = TBOutput
-    comp = parseComputation(arg)
-    buffer.argument = TBOutput
+    comp = parseComputation(parseNode(arg), typ)
     vars[id] = JVar(typ, buffer, comp)
 end
 
@@ -298,12 +327,18 @@ exprHandlers = Dict(
     :(=) => function(expr)
         id = expr.args[1]
         typ = expr.typ
+        rhs = expr.args[2]
 
-        vars[id] = JVar(
-            typ,
-            typToTBuffer[typ](id, typ),
-            parseExpr(expr.args[2]),
-        )
+        if isa(rhs, Variable)
+            # TODO: does this break things?
+            vars[id] = vars[rhs]
+        else
+            vars[id] = JVar(
+                typ,
+                typToTBuffer[typ](id, typ),
+                parseComputation(parseNode(expr.args[2]), typ),
+            )
+        end
     end,
 
     # For return, set buffer to output
@@ -447,7 +482,7 @@ getIndices(indices::Vector{TIndex}) = join(map(getIndex, indices), ", ")
 
 createTExpr(val::TValue) = "expr(($(jToC[val.typ])) $(val.val))"
 function createTExpr(var::TRead)
-    "$(var.var.computation.name)(" * getIndices(var.indices) * ")"
+    "S$(var.var.computation.id)(" * getIndices(var.indices) * ")"
 end
 function createTExpr(op::TOp)
     if op.style == TOpInfix
@@ -466,33 +501,32 @@ end
 
 function createISL(comp::TComputation)
     indices_used = getIndices(comp)
-    return "{$(comp.name)[$indices_used] : " * join(
+    return "{S$(comp.id)[$indices_used] : " * join(
         map(createISLCond, comp.conditions), " and ") * "}"
 end
 
 function tiramisu_analyze_body(ast::Expr, linfo)
     # dump(ast.args)
     # throw(InterruptException())
-    TiramisuPrepass.detector(ast)
     for expr in ast.args
         dump(expr)
-        # parseExpr(expr)
+        parseNode(expr)
     end
-    throw(InterruptException())
+    uvars = unique(values(vars))
     # computation pass
     lines = Vector{String}()
 
-    computations = sort([var.computation for (id, var) in vars], by=(c -> c.name))
+    computations = sort([var.computation for var in uvars], by=(c -> c.id))
     for computation in computations
         push!(lines,
-              "tiramisu::computation $(computation.name)(" *
+              "tiramisu::computation S$(computation.id)(" *
               "\"" * createISL(computation) * "\", " *
               createTExpr(computation.expr) * ", " *
               string(!computation.is_input) * ", " *
               jToT[computation.typ] * ", " *
               "&$function_name);")
     end
-    for (id, var) in vars
+    for var in uvars
         push!(lines,
               "tiramisu::buffer $(var.buffer.name)(" *
               "\"$(var.buffer.name)\", " *
@@ -503,7 +537,7 @@ function tiramisu_analyze_body(ast::Expr, linfo)
               argNames[var.buffer.argument] * ", " *
               "&$function_name);")
         push!(lines,
-              "$(var.computation.name).set_access(\"{$(var.computation.name)[" *
+              "S$(var.computation.id).set_access(\"{S$(var.computation.id)[" *
                 getIndices(var.computation) * "] -> " *
                 "$(var.buffer.name)[" *
                 getIndices(var.computation) * "]}\");")
@@ -511,11 +545,11 @@ function tiramisu_analyze_body(ast::Expr, linfo)
     # Scheduling
     for i=1:(length(computations) - 1)
         push!(lines,
-              "$(computations[i+1].name).after($(computations[i].name), " *
+              "S$(computations[i+1].id).after(S$(computations[i].id), " *
               "computation::root_dimension);")
     end
 
-    interface = [var.buffer.name for (id, var) in vars if var.buffer.argument != TBTemporary]
+    interface = [var.buffer.name for var in uvars if var.buffer.argument != TBTemporary]
     push!(lines, "$function_name.set_arguments({" *
                   join(map(s -> "&" * s, interface), ", ")
                   *"});")

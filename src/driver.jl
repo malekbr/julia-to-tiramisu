@@ -25,14 +25,14 @@ THE POSSIBILITY OF SUCH DAMAGE.
 
 module Driver
 
-export accelerate, toDomainIR, toParallelIR, toFlatParfors, toJulia, toCGen, toTiramisu, toCartesianArray, runStencilMacro, captureOperators, expandParMacro, extractCallGraph, tiramisuPretag
+export accelerate, toDomainIR, toParallelIR, toFlatParfors, toJulia, toCGen, toTiramisu, toCartesianArray, runStencilMacro, captureOperators, expandParMacro, extractCallGraph, tiramisuPretag, tiramisuPrepass, tiramisuClean
 
 using CompilerTools
 using CompilerTools.AstWalker
 using CompilerTools.LambdaHandling
 using CompilerTools.Helper
 
-import ..ParallelAccelerator, ..Comprehension, ..DomainIR, ..ParallelIR, ..CGen, ..API, ..Tiramisu, ..TiramisuPretag
+import ..ParallelAccelerator, ..Comprehension, ..DomainIR, ..ParallelIR, ..CGen, ..API, ..Tiramisu, ..TiramisuPretag, ..TiramisuPrepass, ..TiramisuClean
 import ..dprint, ..dprintln, ..@dprint, ..@dprintln, ..DEBUG_LVL
 #import ..CallGraph.extractStaticCallGraph, ..CallGraph.use_extract_static_call_graph
 using ..J2CArray
@@ -122,6 +122,24 @@ Adds meta tags that help do transformations later.
 function tiramisuPretag(func, ast, sig)
   AstWalk(ast, TiramisuPretag.process_node, nothing)
   return ast
+end
+
+function applyToTypedBody(func::Function, code)
+  if isa(code, Tuple)
+    linfo, body = code
+  else
+    linfo, body = lambdaToLambdaVarInfo(code)
+  end
+  func(body)
+  return LambdaVarInfoToLambda(linfo, body)
+end
+
+function tiramisuPrepass(func :: GlobalRef, code, signature :: Tuple)
+  return applyToTypedBody(TiramisuPrepass.detector, code)
+end
+
+function tiramisuClean(func :: GlobalRef, code, signature :: Tuple)
+  return applyToTypedBody(TiramisuClean.remove_unused!, code)
 end
 
 """

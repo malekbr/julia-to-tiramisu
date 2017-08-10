@@ -1,7 +1,13 @@
 module TiramisuPrepass
 export detector
 
-SupportedNode = Union{LabelNode, GotoNode, Expr, NewvarNode, LineNumberNode}
+using ..ParallelAccelerator
+
+SupportedNode = Union{LabelNode, GotoNode, Expr, NewvarNode, LineNumberNode,
+                      SlotNumber}
+
+mk_expr(sym, varargs...) = Expr(:call, GlobalRef(TiramisuPrepass, sym),
+                                varargs...)
 
 type Future
   matcher::Function
@@ -340,12 +346,12 @@ function forLoopHeaderValidator(state::ForLoopData, ast::Expr)
       push!(for_loop_changer.ignore, state.bottom_index - 1)
       push!(for_loop_changer.ignore, state.bottom_index + 1)
       for_loop_changer.changers[state.header_index] = function()
-        return Expr(:for_loop_start, state.id,
-                    state.from, state.to, 1,
-                    state.loop_var, state.used_loop_var)
+        return mk_expr(:for_loop_start, state.id,
+                       state.from, state.to, 1,
+                       state.loop_var, state.used_loop_var)
       end
       for_loop_changer.changers[state.bottom_index] = function()
-        return Expr(:for_loop_end, state.id)
+        return mk_expr(:for_loop_end, state.id)
       end
       break
     end
@@ -388,7 +394,7 @@ isIfGotoIfNot = Future(onlyExpr(function(expr::Expr, index::Integer, state::IfDa
   is_valid = expr.head === :gotoifnot
   if is_valid
     state.condition = expr.args[1]
-    state.changer.changers[index] = () -> Expr(:if, state.id, state.condition)
+    state.changer.changers[index] = () -> mk_expr(:if, state.id, state.condition)
   end
   return is_valid, state
 end))
@@ -409,7 +415,7 @@ isContinueMeta = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
   is_valid = expr.head === :meta && expr.args[1] === :continue
   if is_valid
     state = ContinueData(expr.args[2], Changer(Set(), Dict()))
-    state.changer.changers[index] = () -> Expr(:continue, state.id)
+    state.changer.changers[index] = () -> mk_expr(:continue, state.id)
   end
   return is_valid, state
 end)
@@ -435,7 +441,7 @@ isEndifMeta = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
   is_valid = expr.head === :meta && expr.args[1] === :endif
   if is_valid
     state = EndifData(expr.args[2], Changer(Set(), Dict()))
-    state.changer.changers[index] = () -> Expr(:endif, state.id)
+    state.changer.changers[index] = () -> mk_expr(:endif, state.id)
   end
   return is_valid, state
 end)
@@ -472,7 +478,7 @@ isElseMeta = onlyExpr(function(expr::Expr, index::Integer, state::ElseData)
   is_valid = expr.head === :meta && expr.args[1] === :else
   if is_valid
     state.id = expr.args[2]
-    state.changer.changers[index] = () -> Expr(:else, state.id)
+    state.changer.changers[index] = () -> mk_expr(:else, state.id)
   end
   return is_valid, state
 end)
@@ -517,7 +523,6 @@ changers = [for_loop_changer, if_changer, continue_changer, endif_changer,
             else_changer]
 
 function detector(ast::Expr)
-  remove_unused!(ast)
   detector(ast, patterns)
   change!(ast, changers)
 end
@@ -580,43 +585,4 @@ function detector(ast::Expr, patterns::Vector{Pattern})
   end
 end
 
-Variable = Union{Slot, SSAValue}
-
-function get_used_def(expr::Expr)
-  # TODO support side effects, and nested assignments
-  def = nothing
-  if expr.head == :(=)
-    def = expr.args[1]
-  end
-  used = union((u for (u, d) in map(get_used_def, expr.args))...)
-  delete!(used, def)
-  return used, Set{Variable}(def == nothing ? [] : [def])
-end
-
-function get_used_def(expr::Variable)
-  return Set{Variable}([expr]), Set{Variable}()
-end
-
-function get_used_def(expr::Any)
-  return Set{Variable}(), Set{Variable}()
-end
-
-function remove_unused!(ast::Expr)
-  # println("Used, def")
-  cleaned = false
-  while !cleaned
-    used = Set{Variable}()
-    def = Set{Variable}()
-    for expr in ast.args
-      u, d = get_used_def(expr)
-      union!(used, u)
-      union!(def, d)
-    end
-    unused = setdiff(def, used)
-    # println(unused)
-    ast.args = [e for e in ast.args
-                if !(isa(e, Expr) && e.head == :(=) && e.args[1] in unused)]
-    cleaned = length(unused) == 0
-  end
-end
 end
