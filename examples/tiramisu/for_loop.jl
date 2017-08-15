@@ -11,15 +11,23 @@ using ParallelAccelerator
   #   end
   # end
   # return t
-  A = Vector{Int64}(15)
-  #B = Vector{Int64}(15)
+  A = Array{Int64}(15, 14, 17)
+  B = Array{Int64}(15, 14, 17)
   for i = 1:15
-    A[i] = 0
+    for j = 1:14
+      for k = 1:17
+        A[i, j, k] = 0
+      end
+    end
   end
-  #for i = 1:15
-  #  B[i] = A[i] + 1
-  #end
-  return A
+  for i = 1:15
+    for j = 1:14
+      for k = 1:17
+        B[i, j, k] = A[i, j, k] + 1
+      end
+    end
+  end
+  return B
 end
 
 function main()

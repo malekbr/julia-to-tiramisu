@@ -62,6 +62,21 @@ jToT = Dict(
             Bool    =>  "p_boolean"
     ) #Map from Julia types to Tiramisu types
 
+jToH = Dict(
+            Int8    =>  "Halide::Int(8)",
+            UInt8   =>  "Halide::UInt(8)",
+            Int16   =>  "Halide::Int(16)",
+            UInt16  =>  "Halide::UInt(16)",
+            Int32   =>  "Halide::Int(32)",
+            UInt32  =>  "Halide::UInt(32)",
+            Int64   =>  "Halide::Int(64)",
+            UInt64  =>  "Halide::UInt(64)",
+            Float16 =>  "Halide::Float(32)",
+            Float32 =>  "Halide::Float(32)",
+            Float64 =>  "Halide::Float(64)",
+            Bool    =>  "Halide::Boolean()"
+)
+
 Primitive = Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64,
                   Float16, Float32, Float64, Bool}
 
@@ -231,7 +246,7 @@ end
 
 type TIndexedRead <: TRead
     var::JVar # TODO should this be a TVar?
-    # TODO deal with indexing
+    indices::Vector{Variable}
 end
 
 vars = Dict{Variable, JVar}()
@@ -282,16 +297,25 @@ end
 
 function parseComputation(expr::TExpr, typ::DataType) # only scalar for now
     if typ <: Primitive
-        var = new_genslot()
-        dummy(var, IntArch)
+        if isempty(condStack)
+            var = new_genslot()
+            dummy(var, IntArch)
+            cond = (wrap(var) == wrap(1))
+            access = TAccess([wrap(var)], [wrap(0)])
+            indices = Variable[var]
+        else
+            cond = condStack[end]
+            access = TAccess(map(wrap, loopVars), [wrap(0)])
+            indices = collect(loopVars)
+        end
         return TComputation(
             new_computation_id(),
-            wrap(var) == wrap(1),
-            1,
+            cond,
+            length(indices),
             expr,
             typ,
-            TAccess([wrap(var)], [wrap(0)]),
-            Variable[var],
+            access,
+            indices,
             false # TODO : fix
         )
     end
@@ -387,6 +411,7 @@ callHandlers = Dict(
     (ParallelAccelerator.API, :setindex!) => function(args::Vector, typ::DataType)
         arr = vars[args[1]]
         texpr = parseNode(args[2])
+        # TODO handle temporal
         indices = collect(Variable, args[3:end])
         assert(issubset(indices, loopVars)) # TODO more thourough checking
         access = TAccess(map(wrap, indices), [wrap(i) - wrap(1) for i in indices])
@@ -401,6 +426,12 @@ callHandlers = Dict(
             false # TODO fix
         )
         arr.computation = comp
+    end,
+    (ParallelAccelerator.API, :getindex) => function(args::Vector, typ::DataType)
+        arr = vars[args[1]]
+        indices = collect(Variable, args[2:end])
+        assert(issubset(indices, loopVars)) # TODO more thourough checking
+        return TIndexedRead(arr, indices)
     end,
 )
 
@@ -438,7 +469,6 @@ function createVar(id, typ, rhs)
             parseComputation(parsed_rhs, typ),
         )
     end
-    dump(vars[id])
     push!(genvars, vars[id])
 end
 
@@ -530,11 +560,7 @@ end
 function buffer_to_ccall_type(buffer)
     # need to construct it in this obscure way to be equivalent to
     # the symbol equivalent of writing
-    t = :($(buffer.typ))
-    for d in buffer.dimensions
-        t = :(Ptr{$(t)})
-    end
-    return t
+    return :(Ptr{$(buffer.typ)})
 end
 
 function buffer_to_ccall_container(buffer)
@@ -613,16 +639,26 @@ getIndices(indices::Vector{TIndex}) = join(map(getIndex, indices), ", ")
 
 VarToString = Dict{Variable, String}
 
-createTExpr(val::TValue) = "expr(($(jToC[val.typ])) $(val.val))"
-function createTExpr(var::TSimpleRead)
-    "S$(var.var.computation.id)(1)"
+createTExpr(val::TValue, varMap::VarToString) = "expr(($(jToC[val.typ])) $(val.val))"
+function createTExpr(var::TSimpleRead, varMap::VarToString)
+    return ("S$(var.var.computation.id)(" *
+            join((varMap[v] for v in var.var.computation.vars), ", ") *
+            ")")
 end
 
-function createTExpr(op::TOp)
+function createTExpr(op::TOp, varMap::VarToString)
     if op.style == TOpInfix
-        return "(" * join(map(createTExpr, op.args), " $(op.fcn) ") * ")"
+        return "(" * join((createTExpr(a, varMap) for a in op.args), " $(op.fcn) ") * ")"
     end
-    return op.fcn * "(" * join(map(createTExpr, op.args), ", ") * ")"
+    return op.fcn * "(" * join((createTExpr(a, varMap) for a in op.args), ", ") * ")"
+end
+
+function createTExpr(var::TIndexedRead, varMap::VarToString)
+    println(varMap)
+    dump(var.indices)
+    return ("S$(var.var.computation.id)(" *
+            join((varMap[v] for v in var.indices), ", ") *
+            ")")
 end
 
 createISLCond(val::TValue, varMap::VarToString) = string(val.val)
@@ -682,7 +718,7 @@ function tiramisu_analyze_body(ast::Expr, linfo)
         push!(lines,
               "\ttiramisu::computation S$(computation.id)(" *
               "\"" * createISL(computation, varMap) * "\", " *
-              createTExpr(computation.expr) * ", " *
+              createTExpr(computation.expr, varMap) * ", " *
               string(!computation.is_input) * ", " *
               jToT[computation.typ] * ", " *
               "&$function_name);")
@@ -695,7 +731,7 @@ function tiramisu_analyze_body(ast::Expr, linfo)
               "\ttiramisu::buffer $(var.buffer.name)(" *
               "\"$(var.buffer.name)\", " *
               string(length(var.buffer.dimensions)) * ", " *
-              "{" * join(map(createTExpr, var.buffer.dimensions), ", ") * "}, " *
+              "{" * join((createTExpr(d, varMap) for d in var.buffer.dimensions), ", ") * "}, " *
               jToT[var.buffer.typ] * ", " *
               "NULL, " *
               argNames[var.buffer.argument] * ", " *
@@ -734,10 +770,18 @@ function buffer_to_arg_prototype(buffer)
 end
 
 function buffer_to_halide_buffer(buffer)
-    return ("Halide::Buffer<$(jToC[buffer.typ])> " *
-            "$(buffer.name)_halide($(buffer.name), " *
-            join(map(d -> "$(d.val)", buffer.dimensions), ", ") *
-            ");")
+    lines = String[]
+    push!(lines,
+          "auto *shape_$(buffer.name) = new halide_dimension_t[$(length(buffer.dimensions))];")
+    for (i, dim) in enumerate(buffer.dimensions)
+        push!(lines, "shape_$(buffer.name)[$(i - 1)].min = 0;")
+        push!(lines, "shape_$(buffer.name)[$(i - 1)].extent = $(dim.val);") # TODO not always TValue
+        push!(lines, "shape_$(buffer.name)[$(i - 1)].stride = 1;")
+    end
+    push!(lines, "Halide::Buffer<> " *
+                 "$(buffer.name)_halide($(jToH[buffer.typ]), $(buffer.name), " *
+                 "$(length(buffer.dimensions)), shape_$(buffer.name));")
+    return join(lines, "\n")
 end
 
 function buffer_to_raw_buffer(buffer)
