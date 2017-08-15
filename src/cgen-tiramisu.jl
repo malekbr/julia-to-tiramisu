@@ -70,7 +70,7 @@ Primitive = Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64,
 IntArch = typeof(1)
 
 # Generated slot
-type GenSlot
+immutable GenSlot
     id::IntArch
 end
 
@@ -99,6 +99,19 @@ const LIB = "$TIRAMISU_BUILD_DIR/thello.so"
 function_name = ""
 computationIndex = 0
 computationPrefix = "S"
+
+function make_counter()
+    counter = -1
+    return function()
+        counter += 1
+        return counter
+    end
+end
+
+new_computation_id = make_counter()
+
+genslot_counter = make_counter()
+new_genslot() = GenSlot(genslot_counter())
 
 @enum TBufferArgument TBOutput TBInput TBTemporary
 argNames = Dict(
@@ -140,6 +153,11 @@ type TBuffer
     is_scalar::Bool
 end
 
+type TAlloc <: TExpr
+    dims::Vector{TExpr}
+    typ::DataType
+end
+
 
 
 type TConstant
@@ -157,40 +175,43 @@ type ISLCondition
     lim::String
 end
 
+type TAccess
+    computation::Vector{TExpr}
+    buffer::Vector{TExpr}
+end
+
 type TComputation
     #computation S0("[N]->{S0[i,j]: 0<=i<N and 0<=j<N}", e3, true, p_uint8, &function0);
     id::Integer
-    conditions::Array{ISLCondition}
+    condition::TExpr
     dim::Unsigned
     expr::TExpr
     typ::DataType
-#    access
+    access::TAccess
+    vars::Vector{Variable}
     is_input::Bool
 end
 
 
-type TRange
-    iterator
-    low
-    high
-end
-
-type TAccess
-    buf
-    ind
-    val
-end
 
 type TSignature
     args
     ret
 end
 
-type JVar
+abstract TVar
+
+type JVar <: TVar # Julia Variable
+    id::Variable
     typ::DataType
-    buffer::TBuffer
-    computation::TComputation
+    buffer::Union{TBuffer, Void}
+    computation::Union{TComputation, Void} # Might not be there already
 end
+
+type DVar <: TVar # Dummy variable TODO remove
+    id::GenSlot
+end
+
 
 abstract TIndex
 
@@ -202,12 +223,19 @@ type TVarIndex <: TIndex
     letter::Unsigned
 end
 
-type TRead <: TExpr
-    var::JVar
-    indices::Vector{TIndex}
+abstract TRead <: TExpr
+
+type TSimpleRead <: TRead
+    var::TVar
+end
+
+type TIndexedRead <: TRead
+    var::JVar # TODO should this be a TVar?
+    # TODO deal with indexing
 end
 
 vars = Dict{Variable, JVar}()
+genvars = Vector{JVar}()
 
 idToBufferName(id::SSAValue) = "BSSA" * string(id.id)
 idToBufferName(id::SlotNumber) = "BSN" * string(id.id)
@@ -223,18 +251,6 @@ typToTBuffer = Dict(
     end,
 )
 
-function make_counter()
-    counter = -1
-    return function()
-        counter += 1
-        return counter
-    end
-end
-
-new_computation_id = make_counter()
-
-genslot_counter = make_counter()
-new_genslot() = GenSlot(genslot_counter())
 
 function parseNode(node::Expr)
     return exprHandlers[node.head](node)
@@ -246,7 +262,7 @@ function parseNode(node::Variable)
         throw(UndefVarError(Symbol(node)))
     end
     # TODO: Indexing should not be done here
-    return TRead(vars[node], [TConstIndex(0)])
+    return TSimpleRead(vars[node])
 end
 
 function parseNode(node::Primitive)
@@ -264,15 +280,21 @@ function parseComputation(expr::TComputation, typ::DataType)
     return expr
 end
 
-function parseComputation(expr::TExpr, typ::DataType)
-    return TComputation(
-        new_computation_id(),
-        [ISLCondition("i", "=", "0")],
-        1,
-        expr,
-        typ,
-        false # TODO : fix
-    )
+function parseComputation(expr::TExpr, typ::DataType) # only scalar for now
+    if typ <: Primitive
+        var = new_genslot()
+        dummy(var, IntArch)
+        return TComputation(
+            new_computation_id(),
+            wrap(var) == wrap(1),
+            1,
+            expr,
+            typ,
+            TAccess([wrap(var)], [wrap(0)]),
+            Variable[var],
+            false # TODO : fix
+        )
+    end
 end
 
 function typedOp!(op::TOp, typ::DataType)
@@ -280,18 +302,57 @@ function typedOp!(op::TOp, typ::DataType)
     return op
 end
 
-+(a::TExpr, b::TExpr) = TOp("", "+", TOpInfix, [a, b], Void)
+function opToISL(op::String)
+    if op == "=="
+        return "="
+    elseif op == "&&"
+        return "and"
+    else
+        return op
+    end
+end
+
++(args::Vararg{TExpr}) = TOp("", "+", TOpInfix, collect(args), Void)
+-(args::Vararg{TExpr}) = TOp("", "-", TOpInfix, collect(args), Void)
+==(args::Vararg{TExpr}) = TOp("", "==", TOpInfix, collect(args), Bool)
+<=(args::Vararg{TExpr}) = TOp("", "<=", TOpInfix, collect(args), Bool)
+and(args::Vararg{TExpr}) = TOp("", "&&", TOpInfix, collect(args), Bool)
+
+function dummy(id::Variable, typ::DataType)
+    return vars[id] = JVar(
+        id,
+        typ,
+        nothing,
+        nothing
+    )
+end
 
 wrap(val::TExpr) = val
 
 wrap(val::Union{Primitive, Variable}) = parseNode(val)
 
+wrap(val::TVar) = TSimpleRead(val)
+
 function wrap(val::Any)
     # Shouldn't have nested calls
     print_with_color(:yellow, "Trying to wrap:\n")
     dump(val)
-    return wrap
+    return val
 end
+
+abstract Clause
+
+immutable ForLoop <: Clause
+    id::IntArch
+    from::IntArch
+    to::IntArch
+    inc::IntArch
+    var::TVar
+end
+
+clauseStack = Vector{Clause}()
+condStack = Vector{TExpr}()
+loopVars = Vector{Variable}()
 
 callHandlers = Dict(
     (Core.Intrinsics, :add_int) => function(args::Vector, typ::DataType)
@@ -299,7 +360,48 @@ callHandlers = Dict(
     end,
     (Core.Intrinsics, :box) => function(args::Vector, typ::DataType)
         return parseNode(args[2])
-    end
+    end,
+    (ParallelAccelerator.TiramisuPrepass, :for_loop_start) => function(args::Vector, typ::DataType)
+        id = args[1]
+        from = args[2]
+        to = args[3]
+        inc = args[4]
+        varid = args[6]
+        var = dummy(varid, IntArch)
+        push!(clauseStack, ForLoop(id, from, to, inc, var))
+        push!(loopVars, varid)
+        cond = <=(wrap(from), wrap(var), wrap(to))
+        if isempty(condStack)
+            push!(condStack, cond)
+        else
+            push!(condStack, and(condStack[end], cond))
+        end
+    end,
+    (ParallelAccelerator.TiramisuPrepass, :for_loop_end) => function(args::Vector, typ::DataType)
+        id = args[1]
+        assert(id == clauseStack[end].id)
+        pop!(clauseStack)
+        pop!(loopVars)
+        pop!(condStack)
+    end,
+    (ParallelAccelerator.API, :setindex!) => function(args::Vector, typ::DataType)
+        arr = vars[args[1]]
+        texpr = parseNode(args[2])
+        indices = collect(Variable, args[3:end])
+        assert(issubset(indices, loopVars)) # TODO more thourough checking
+        access = TAccess(map(wrap, indices), [wrap(i) - wrap(1) for i in indices])
+        comp = TComputation(
+            new_computation_id(),
+            condStack[end],
+            length(indices),
+            texpr,
+            arr.typ,
+            access,
+            indices,
+            false # TODO fix
+        )
+        arr.computation = comp
+    end,
 )
 
 function handleReturn(arg::Variable, typ::DataType)
@@ -311,7 +413,33 @@ function handleReturn(arg, typ::DataType)
     buffer = typToTBuffer[typ](id, typ)
     buffer.argument = TBOutput
     comp = parseComputation(parseNode(arg), typ)
-    vars[id] = JVar(typ, buffer, comp)
+    vars[id] = JVar(id, typ, buffer, comp)
+    push!(genvars, vars[id])
+end
+
+function createVar(id, typ, rhs)
+    parsed_rhs = parseNode(rhs)
+    if isa(parsed_rhs, TAlloc)
+        vars[id] = JVar(
+            id,
+            parsed_rhs.typ,
+            TBuffer(idToBufferName(id),
+                    parsed_rhs.dims,
+                    parsed_rhs.typ,
+                    TBTemporary,
+                    false),
+            nothing
+        )
+    else
+        vars[id] = JVar(
+            id,
+            typ,
+            typToTBuffer[typ](id, typ),
+            parseComputation(parsed_rhs, typ),
+        )
+    end
+    dump(vars[id])
+    push!(genvars, vars[id])
 end
 
 exprHandlers = Dict(
@@ -333,12 +461,12 @@ exprHandlers = Dict(
             # TODO: does this break things?
             vars[id] = vars[rhs]
         else
-            vars[id] = JVar(
-                typ,
-                typToTBuffer[typ](id, typ),
-                parseComputation(parseNode(expr.args[2]), typ),
-            )
+            createVar(id, typ, rhs)
         end
+    end,
+
+    :alloc => function(expr)
+        return TAlloc([parseNode(n) for n in expr.args[2]], expr.args[1])
     end,
 
     # For return, set buffer to output
@@ -428,7 +556,7 @@ end
 # - The corresponding containers in a list
 function get_return()
     # TODO : handle input
-    interface = [var.buffer for (id, var) in vars if var.buffer.argument == TBOutput]
+    interface = [var.buffer for var in genvars if var.buffer.argument == TBOutput]
     # TODO: handle Tuple return
     assert(length(interface) == 1)
     decouple = interface[1].is_scalar ? decouple_scalar : decouple_buffer
@@ -471,7 +599,10 @@ function tiramisu_set_function(f)
     computationPrefix = f*"_S"
     s = string("int main()\n{\n",
                 "\tglobal::set_default_tiramisu_options();\n",
-                "\tfunction $function_name(\"$function_name\");\n")
+                "\tfunction $function_name(\"$function_name\");\n",
+                "\ttiramisu::var ",
+                join(("$v(\"$v\")" for v in indexNames), ", "),
+                ";\n")
 end
 
 getIndex(index::TConstIndex) = string(index.val)
@@ -480,29 +611,57 @@ getIndex(index::TVarIndex) = indexNames[index.letter]
 
 getIndices(indices::Vector{TIndex}) = join(map(getIndex, indices), ", ")
 
+VarToString = Dict{Variable, String}
+
 createTExpr(val::TValue) = "expr(($(jToC[val.typ])) $(val.val))"
-function createTExpr(var::TRead)
-    "S$(var.var.computation.id)(" * getIndices(var.indices) * ")"
-end
-function createTExpr(op::TOp)
-    if op.style == TOpInfix
-        return join(map(createTExpr, op.args), op.fcn)
-    end
-    return op.fcn * "(" * join(map(createTExpr, op.args), ",") * ")"
+function createTExpr(var::TSimpleRead)
+    "S$(var.var.computation.id)(1)"
 end
 
-function createISLCond(cond::ISLCondition)
-    return "$(cond.var) $(cond.op) $(cond.lim)"
+function createTExpr(op::TOp)
+    if op.style == TOpInfix
+        return "(" * join(map(createTExpr, op.args), " $(op.fcn) ") * ")"
+    end
+    return op.fcn * "(" * join(map(createTExpr, op.args), ", ") * ")"
+end
+
+createISLCond(val::TValue, varMap::VarToString) = string(val.val)
+
+function createISLCond(var::TSimpleRead, varMap::VarToString)
+    return varMap[var.var.id]
+end
+
+function createISLCond(op::TOp, varMap::VarToString)
+    createCond = arg -> createISLCond(arg, varMap)
+    if op.style == TOpInfix
+        return "(" * join(map(createCond, op.args), " $(opToISL(op.fcn)) ") * ")"
+    end
+    return opToISL(op.fcn) * "(" * join(map(createCond, op.args), ", ") * ")"
 end
 
 function getIndices(comp::TComputation)
-    return join(indexNames[1:comp.dim], ", ")
+    return join(indexNames[1:length(comp.vars)], ", ")
 end
 
-function createISL(comp::TComputation)
-    indices_used = getIndices(comp)
-    return "{S$(comp.id)[$indices_used] : " * join(
-        map(createISLCond, comp.conditions), " and ") * "}"
+function createISL(comp::TComputation, varMap::VarToString)
+    for (var, index) in zip(comp.vars, indexNames)
+        varMap[var] = string(index)
+    end
+    cond = createISLCond(comp.condition, varMap)
+    indices = getIndices(comp)
+    return "{S$(comp.id)[$indices] : $cond}"
+end
+
+function createAccess(access::Vector{TExpr}, varMap)
+    return join((createISLCond(expr, varMap) for expr in access), ",")
+end
+
+function createAccess(comp::TComputation, varMap::VarToString)
+    for (var, index) in zip(comp.vars, indexNames)
+        varMap[var] = string(index)
+    end
+    return (createAccess(comp.access.computation, varMap),
+            createAccess(comp.access.buffer, varMap))
 end
 
 function tiramisu_analyze_body(ast::Expr, linfo)
@@ -512,23 +671,28 @@ function tiramisu_analyze_body(ast::Expr, linfo)
         dump(expr)
         parseNode(expr)
     end
-    uvars = unique(values(vars))
+    uvars = unique(genvars)
     # computation pass
     lines = Vector{String}()
 
+    println("Computation")
     computations = sort([var.computation for var in uvars], by=(c -> c.id))
     for computation in computations
+        varMap = VarToString()
         push!(lines,
-              "tiramisu::computation S$(computation.id)(" *
-              "\"" * createISL(computation) * "\", " *
+              "\ttiramisu::computation S$(computation.id)(" *
+              "\"" * createISL(computation, varMap) * "\", " *
               createTExpr(computation.expr) * ", " *
               string(!computation.is_input) * ", " *
               jToT[computation.typ] * ", " *
               "&$function_name);")
     end
+    println("Buffers")
     for var in uvars
+        varMap = VarToString()
+        cIndices, bIndices = createAccess(var.computation, varMap)
         push!(lines,
-              "tiramisu::buffer $(var.buffer.name)(" *
+              "\ttiramisu::buffer $(var.buffer.name)(" *
               "\"$(var.buffer.name)\", " *
               string(length(var.buffer.dimensions)) * ", " *
               "{" * join(map(createTExpr, var.buffer.dimensions), ", ") * "}, " *
@@ -537,27 +701,29 @@ function tiramisu_analyze_body(ast::Expr, linfo)
               argNames[var.buffer.argument] * ", " *
               "&$function_name);")
         push!(lines,
-              "S$(var.computation.id).set_access(\"{S$(var.computation.id)[" *
-                getIndices(var.computation) * "] -> " *
-                "$(var.buffer.name)[" *
-                getIndices(var.computation) * "]}\");")
+              "\tS$(var.computation.id).set_access(\"" *
+              "{S$(var.computation.id)[$cIndices] -> $(var.buffer.name)[$bIndices]}" *
+              "\");")
     end
     # Scheduling
+    println("Scheduling")
     for i=1:(length(computations) - 1)
         push!(lines,
-              "S$(computations[i+1].id).after(S$(computations[i].id), " *
+              "\tS$(computations[i+1].id).after(S$(computations[i].id), " *
               "computation::root_dimension);")
     end
 
+    println("Interface")
     interface = [var.buffer.name for var in uvars if var.buffer.argument != TBTemporary]
-    push!(lines, "$function_name.set_arguments({" *
+    push!(lines, "\t$function_name.set_arguments({" *
                   join(map(s -> "&" * s, interface), ", ")
                   *"});")
-    push!(lines, "$function_name.gen_time_space_domain();")
-    push!(lines, "$function_name.gen_isl_ast();")
-    push!(lines, "$function_name.gen_halide_stmt();")
-    push!(lines, "$function_name.gen_halide_obj(\"$OBJ\");")
-    push!(lines, "return 0;")
+    push!(lines, "\t$function_name.gen_time_space_domain();")
+    push!(lines, "\t$function_name.gen_isl_ast();")
+    push!(lines, "\t$function_name.gen_halide_stmt();")
+    push!(lines, "\t$function_name.gen_halide_obj(\"$OBJ\");")
+    push!(lines, "\treturn 0;")
+    println("WHAT")
     return join(lines, '\n')
 end
 
@@ -588,10 +754,13 @@ function generate_wrapper()
     push!(lines, "int main(int, char**) {")
     push!(lines, "return 0;")
     push!(lines, "}")
-    interface = [var.buffer for (id, var) in vars if var.buffer.argument != TBTemporary]
+    interface = [var.buffer for var in genvars if var.buffer.argument != TBTemporary]
+    push!(lines, "extern \"C\" int $function_name(" * join(("halide_buffer_t *" for _ in interface), ", ") * ");")
+    push!(lines, "#pragma GCC visibility push(default)")
     push!(lines, "extern \"C\" void $(function_name)_wrapper(" *
                   join(map(buffer_to_arg_prototype, interface), ", ") *
                   ") {")
+    push!(lines, "#pragma GCC visibility pop")
     for buffer in interface
         push!(lines, buffer_to_halide_buffer(buffer))
     end
@@ -653,6 +822,7 @@ function tiramisu_get_lib_obj()
     push!(s,"-L$ISL_LIB_DIR")
     push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_LIB_DIR","-lHalide","-ldl")
     push!(s,"-lpthread","-lz","-ljpeg","-ltinfo")#`libpng-config --cflags --ldflags`","-ljpeg")
+    push!(s,"$FILENAME_WRAPPER")
     push!(s,"-shared","-fPIC","-o","$OBJ_WRAPPER")
     Cmd(s)
 end
@@ -679,6 +849,7 @@ function tiramisu_get_lib()
     push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_LIB_DIR","-lHalide","-ldl")
     push!(s,"-lpthread","-lz","-ljpeg","-ltinfo")#`libpng-config --cflags --ldflags`","-ljpeg")
     push!(s,"-shared","-fPIC","-o","$LIB")
+    println(join(s, " "))
     Cmd(s)
 end
 

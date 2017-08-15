@@ -11,35 +11,15 @@ using ParallelAccelerator
   #   end
   # end
   # return t
-  t = 0
-  for i=1:5
-    if i == 2
-      continue
-    end
-    for j=7:9
-      t = t + i + j
-      if i == 3
-        t += 5
-      elseif j + i == 3
-        continue
-      elseif i == 4
-        t += 2
-      else
-        t += 1
-      end
-    end
+  A = Vector{Int64}(15)
+  #B = Vector{Int64}(15)
+  for i = 1:15
+    A[i] = 0
   end
-  k = 0
-  for i=1:8
-    for j=-14:13
-      k += 2
-    end
-  end
-  # t = 0
-  # for i=1:5
-  #   t = t + 1
-  # end
-  return t + k
+  #for i = 1:15
+  #  B[i] = A[i] + 1
+  #end
+  return A
 end
 
 function main()
