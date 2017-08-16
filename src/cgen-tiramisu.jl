@@ -30,6 +30,14 @@ importall Base
 
 export tiramisu_from_root_entry, tcanonicalize
 
+primitives = DataType[Int8, UInt8,
+                     Int16, UInt16,
+                     Int32, UInt32,
+                     Int64, UInt64,
+                     Float16, Float32,
+                     Float64, Bool,
+                     Char, Void]
+
 jToC = Dict(
             Int8    =>  "int8_t",
             UInt8   =>  "uint8_t",
@@ -256,15 +264,19 @@ idToBufferName(id::SSAValue) = "BSSA" * string(id.id)
 idToBufferName(id::SlotNumber) = "BSN" * string(id.id)
 idToBufferName(id::GenSlot) = "BGS" * string(id.id)
 
-typToTBuffer = Dict(
-    IntArch => function(id, typ)
-        return TBuffer(idToBufferName(id),
-                       [TValue("", 1, IntArch)],
-                       IntArch,
-                       TBTemporary,
-                       true)
-    end,
-)
+macro typToBufferGen(types)
+    return esc(Expr(:call,
+                    :Dict,
+                    (:($(typ) => function(id, typ)
+                        return TBuffer(idToBufferName(id),
+                                       [TValue("", 1, IntArch)],
+                                       $(typ),
+                                       TBTemporary,
+                                       true)
+                    end) for typ in eval(types))...))
+end
+
+typToTBuffer = @typToBufferGen primitives
 
 
 function parseNode(node::Expr)
@@ -396,6 +408,10 @@ callHandlers = Dict(
     end,
     (Core.Intrinsics, :box) => function(args::Vector, typ::DataType)
         return parseNode(args[2])
+    end,
+    (Core.Intrinsics, :checked_trunc_sint) => function(args::Vector, typ::DataType)
+        res = args[1](args[2]) # throw an error if invalid
+        return parseNode(res)
     end,
     (ParallelAccelerator.TiramisuPrepass, :for_loop_start) => function(args::Vector, typ::DataType)
         id = args[1]
@@ -686,8 +702,6 @@ function createTExpr(op::TOp, varMap::VarToString)
 end
 
 function createTExpr(var::TIndexedRead, varMap::VarToString)
-    println(varMap)
-    dump(var.indices)
     return ("S$(var.var.computation.id)(" *
             join((varMap[v] for v in var.indices), ", ") *
             ")")
@@ -779,18 +793,16 @@ function tiramisu_analyze_body(ast::Expr, linfo)
     noAfterScheduling = Set{IntArch}()
     # TODO specify or compute fuse level
     for comps in values(fuseSet)
-        for c in comps
-            push!(noAfterScheduling, c.id)
-        end
         fuseLevel = minimum(length(c.vars) for c in comps) - 1
         for i=1:(length(comps) - 1)
+            push!(noAfterScheduling, comps[i].id)
             push!(lines,
                   "\tS$(comps[i+1].id).fuse_after($fuseLevel, &S$(comps[i].id));")
         end
     end
 
     for i=1:(length(computations) - 1)
-        if computations[i + 1].id in noAfterScheduling
+        if computations[i].id in noAfterScheduling
             continue
         end
         push!(lines,
@@ -808,7 +820,6 @@ function tiramisu_analyze_body(ast::Expr, linfo)
     push!(lines, "\t$function_name.gen_halide_stmt();")
     push!(lines, "\t$function_name.gen_halide_obj(\"$OBJ\");")
     push!(lines, "\treturn 0;")
-    println("WHAT")
     return join(lines, '\n')
 end
 
@@ -942,7 +953,6 @@ function tiramisu_get_lib()
     push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_LIB_DIR","-lHalide","-ldl")
     push!(s,"-lpthread","-lz","-ljpeg","-ltinfo")#`libpng-config --cflags --ldflags`","-ljpeg")
     push!(s,"-shared","-fPIC","-o","$LIB")
-    println(join(s, " "))
     Cmd(s)
 end
 
