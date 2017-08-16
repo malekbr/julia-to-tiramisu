@@ -308,7 +308,7 @@ function parseComputation(expr::TExpr, typ::DataType) # only scalar for now
             access = TAccess(map(wrap, loopVars), [wrap(0)])
             indices = collect(loopVars)
         end
-        return TComputation(
+        comp = TComputation(
             new_computation_id(),
             cond,
             length(indices),
@@ -318,6 +318,18 @@ function parseComputation(expr::TExpr, typ::DataType) # only scalar for now
             indices,
             false # TODO : fix
         )
+        sched(comp)
+        return comp
+    end
+end
+
+function sched(comp::TComputation)
+    if !isempty(fuseStack)
+        if haskey(fuseSet, fuseStack[end])
+            push!(fuseSet[fuseStack[end]], comp)
+        else
+            fuseSet[fuseStack[end]] = TComputation[comp]
+        end
     end
 end
 
@@ -425,6 +437,7 @@ callHandlers = Dict(
             indices,
             false # TODO fix
         )
+        sched(comp)
         arr.computation = comp
     end,
     (ParallelAccelerator.API, :getindex) => function(args::Vector, typ::DataType)
@@ -472,6 +485,21 @@ function createVar(id, typ, rhs)
     push!(genvars, vars[id])
 end
 
+fuseSet = Dict{IntArch, Vector{TComputation}}()
+fuseStack = Vector{IntArch}()
+
+metaHandlers = Dict(
+    :fuse => function(args)
+        push!(fuseStack, args[1])
+    end,
+
+    :endfuse => function(args)
+        assert(fuseStack[end] == args[1])
+        pop!(fuseStack)
+    end,
+
+)
+
 exprHandlers = Dict(
     # In case of call, lookup the function in the list of supported functions
     :call => function(expr)
@@ -497,6 +525,10 @@ exprHandlers = Dict(
 
     :alloc => function(expr)
         return TAlloc([parseNode(n) for n in expr.args[2]], expr.args[1])
+    end,
+
+    :meta => function(expr)
+        metaHandlers[expr.args[1]](expr.args[2:end])
     end,
 
     # For return, set buffer to output
@@ -743,7 +775,24 @@ function tiramisu_analyze_body(ast::Expr, linfo)
     end
     # Scheduling
     println("Scheduling")
+
+    noAfterScheduling = Set{IntArch}()
+    # TODO specify or compute fuse level
+    for comps in values(fuseSet)
+        for c in comps
+            push!(noAfterScheduling, c.id)
+        end
+        fuseLevel = minimum(length(c.vars) for c in comps) - 1
+        for i=1:(length(comps) - 1)
+            push!(lines,
+                  "\tS$(comps[i+1].id).fuse_after($fuseLevel, &S$(comps[i].id));")
+        end
+    end
+
     for i=1:(length(computations) - 1)
+        if computations[i + 1].id in noAfterScheduling
+            continue
+        end
         push!(lines,
               "\tS$(computations[i+1].id).after(S$(computations[i].id), " *
               "computation::root_dimension);")

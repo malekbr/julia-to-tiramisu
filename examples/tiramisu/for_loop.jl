@@ -16,14 +16,14 @@ using ParallelAccelerator
   for i = 1:15
     for j = 1:14
       for k = 1:17
-        A[i, j, k] = 0
+        @fuse 1 A[i, j, k] = 0
       end
     end
   end
   for i = 1:15
     for j = 1:14
       for k = 1:17
-        B[i, j, k] = A[i, j, k] + 1
+        @fuse 1 B[i, j, k] = A[i, j, k] + 1
       end
     end
   end

@@ -382,10 +382,17 @@ function __init__()
     end
 end
 
+macro fuse(id, code)
+    return Expr(:block,
+                Expr(:meta, :fuse, id),
+                esc(code),
+                Expr(:meta, :endfuse, id))
+end
+
 import .API.@par
 import .API.runStencil
 import .API.cartesianarray
 import .API.parallel_for
-export accelerate, @acc, @noacc, @par, runStencil, cartesianarray, parallel_for
+export accelerate, @acc, @noacc, @par, @fuse, runStencil, cartesianarray, parallel_for
 
 end
