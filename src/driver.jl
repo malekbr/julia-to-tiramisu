@@ -456,7 +456,9 @@ function toTiramisu(func :: GlobalRef, code, signature :: Tuple)
     lib = Libdl.dlopen($dyn_lib)
     func_sym = Symbol($function_name_string * "_wrapper")
     func = Libdl.dlsym(lib, func_sym)
+    tic()
     ccall(func, Void, $types, $containers...)
+    println("Execution time ", toq())
     return $decouple($containers)
   end
 

@@ -330,18 +330,76 @@ function parseComputation(expr::TExpr, typ::DataType) # only scalar for now
             indices,
             false # TODO : fix
         )
-        sched(comp)
+        schedule(comp)
         return comp
     end
 end
 
-function sched(comp::TComputation)
-    if !isempty(fuseStack)
-        if haskey(fuseSet, fuseStack[end])
-            push!(fuseSet[fuseStack[end]], comp)
-        else
-            fuseSet[fuseStack[end]] = TComputation[comp]
-        end
+@enum SchedTime SchedNext SchedNow SchedNever
+
+const RootDimension = -1
+
+SchedLevel = Int
+
+type DelayedSchedule
+    level::SchedLevel
+    time::SchedTime
+end
+
+type OnceSchedule
+    level::SchedLevel
+    time::SchedTime
+end
+
+type ScheduleState
+    for_level::DelayedSchedule
+    fuse_level::OnceSchedule
+    previous_comp::Union{TComputation, Void}
+    schedule::Vector{Pair{Pair{TComputation, TComputation}, SchedLevel}}
+    parallelize_level::Union{Int, Void}
+    parallelize::Vector{Pair{TComputation, Int}}
+end
+
+readSchedLevel(level::SchedLevel) = level
+function readSchedLevel(level::DelayedSchedule)
+    if level.time == SchedNext
+        level.time = SchedNow
+        return RootDimension
+    elseif level.time == SchedNow
+        return level.level
+    else
+        # SchedNever
+        return RootDimension
+    end
+end
+function readSchedLevel(level::OnceSchedule)
+    if level.time == SchedNext
+        level.time = SchedNow
+        return RootDimension
+    elseif level.time == SchedNow
+        level.time = SchedNever
+        return level.level
+    else
+        # SchedNever
+        return RootDimension
+    end
+end
+
+
+sched = ScheduleState(DelayedSchedule(RootDimension, SchedNever),
+                      OnceSchedule(RootDimension, SchedNever),
+                      nothing, [], nothing, [])
+
+function schedule(comp::TComputation)
+    level = maximum(map(readSchedLevel, [sched.for_level, sched.fuse_level]))
+    if sched.previous_comp != nothing
+        # Not the first computation
+        push!(sched.schedule, (sched.previous_comp => comp) => level)
+    end
+    sched.previous_comp = comp
+    if sched.parallelize_level != nothing
+        push!(sched.parallelize, comp => sched.parallelize_level)
+        sched.parallelize_level = nothing
     end
 end
 
@@ -402,6 +460,7 @@ clauseStack = Vector{Clause}()
 condStack = Vector{TExpr}()
 loopVars = Vector{Variable}()
 
+
 callHandlers = Dict(
     (Core.Intrinsics, :add_int) => function(args::Vector, typ::DataType)
         return typedOp!(+(map(wrap, args)...), typ)
@@ -428,6 +487,7 @@ callHandlers = Dict(
         else
             push!(condStack, and(condStack[end], cond))
         end
+        sched.for_level = DelayedSchedule(Unsigned(length(loopVars) - 1), SchedNext)
     end,
     (ParallelAccelerator.TiramisuPrepass, :for_loop_end) => function(args::Vector, typ::DataType)
         id = args[1]
@@ -435,6 +495,11 @@ callHandlers = Dict(
         pop!(clauseStack)
         pop!(loopVars)
         pop!(condStack)
+        if isempty(loopVars)
+            sched.for_level = DelayedSchedule(RootDimension, SchedNever)
+        else
+            sched.for_level = DelayedSchedule(Unsigned(length(loopVars) - 1), SchedNow)
+        end
     end,
     (ParallelAccelerator.API, :setindex!) => function(args::Vector, typ::DataType)
         arr = vars[args[1]]
@@ -453,7 +518,7 @@ callHandlers = Dict(
             indices,
             false # TODO fix
         )
-        sched(comp)
+        schedule(comp)
         arr.computation = comp
     end,
     (ParallelAccelerator.API, :getindex) => function(args::Vector, typ::DataType)
@@ -501,17 +566,22 @@ function createVar(id, typ, rhs)
     push!(genvars, vars[id])
 end
 
-fuseSet = Dict{IntArch, Vector{TComputation}}()
-fuseStack = Vector{IntArch}()
 
 metaHandlers = Dict(
+    :parallel => function(args)
+        sched.parallelize_level = length(loopVars)
+    end,
+
+    :endparallel => function(args)
+        sched.parallelize_level = nothing
+    end,
+
     :fuse => function(args)
-        push!(fuseStack, args[1])
+        # do nothing
     end,
 
     :endfuse => function(args)
-        assert(fuseStack[end] == args[1])
-        pop!(fuseStack)
+        sched.fuse_level = OnceSchedule(Unsigned(args[1]), SchedNow)
     end,
 
 )
@@ -746,6 +816,10 @@ function createAccess(comp::TComputation, varMap::VarToString)
             createAccess(comp.access.buffer, varMap))
 end
 
+createSchedLevel(level::SchedLevel) = ((level == RootDimension) ?
+                                       "tiramisu::computation::root_dimension" :
+                                       "$level")
+
 function tiramisu_analyze_body(ast::Expr, linfo)
     # dump(ast.args)
     # throw(InterruptException())
@@ -789,26 +863,15 @@ function tiramisu_analyze_body(ast::Expr, linfo)
     end
     # Scheduling
     println("Scheduling")
-
-    noAfterScheduling = Set{IntArch}()
-    # TODO specify or compute fuse level
-    for comps in values(fuseSet)
-        fuseLevel = minimum(length(c.vars) for c in comps) - 1
-        for i=1:(length(comps) - 1)
-            push!(noAfterScheduling, comps[i].id)
-            push!(lines,
-                  "\tS$(comps[i+1].id).fuse_after($fuseLevel, &S$(comps[i].id));")
-        end
+    for ((c1, c2), level) in sched.schedule
+        push!(lines, "\tS$(c2.id).after(S$(c1.id), $(createSchedLevel(level)));")
     end
 
-    for i=1:(length(computations) - 1)
-        if computations[i].id in noAfterScheduling
-            continue
-        end
-        push!(lines,
-              "\tS$(computations[i+1].id).after(S$(computations[i].id), " *
-              "computation::root_dimension);")
+    for (c, level) in sched.parallelize
+        push!(lines, "\tS$(c.id).tag_parallel_level($level);")
     end
+
+
 
     println("Interface")
     interface = [var.buffer.name for var in uvars if var.buffer.argument != TBTemporary]

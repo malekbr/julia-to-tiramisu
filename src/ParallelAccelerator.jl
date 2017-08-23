@@ -382,17 +382,28 @@ function __init__()
     end
 end
 
-macro fuse(id, code)
+macro fuse(level, code)
+    @assert level ≥ 1 "Fuse level must be at least 1"
     return Expr(:block,
-                Expr(:meta, :fuse, id),
+                Expr(:meta, :fuse, level - 1),
                 esc(code),
-                Expr(:meta, :endfuse, id))
+                Expr(:meta, :endfuse, level - 1))
 end
 
+macro tagparallel(meta, code)
+    @assert meta.head == :meta && meta.args[1] == :forloop "tagparallel needs to be applied to a for loop"
+    @assert code.head == :for "tagparallel needs to be applied to a for loop"
+    return Expr(:block, Expr(:meta, :parallel), esc(meta), esc(code), Expr(:meta, :endparallel))
+end
+
+macro tagparallel(code)
+    @assert code.head == :for "tagparallel needs to be applied to a for loop"
+    return Expr(:block, Expr(:meta, :parallel), esc(code), Expr(:meta, :endparallel))
+end
 import .API.@par
 import .API.runStencil
 import .API.cartesianarray
 import .API.parallel_for
-export accelerate, @acc, @noacc, @par, @fuse, runStencil, cartesianarray, parallel_for
+export accelerate, @acc, @noacc, @par, @fuse, @tagparallel, runStencil, cartesianarray, parallel_for
 
 end
