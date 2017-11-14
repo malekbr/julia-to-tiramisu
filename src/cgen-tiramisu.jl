@@ -45,8 +45,10 @@ jToC = Dict(
             UInt16  =>  "uint16_t",
             Int32   =>  "int32_t",
             UInt32  =>  "uint32_t",
-            Int64   =>  "int64_t",
-            UInt64  =>  "uint64_t",
+            # Int64   =>  "int64_t",
+            # UInt64  =>  "uint64_t",
+            Int64   =>  "int32_t",
+            UInt64  =>  "uint32_t",
             Float16 =>  "float",
             Float32 =>  "float",
             Float64 =>  "double",
@@ -62,8 +64,8 @@ jToT = Dict(
             UInt16  =>  "p_uint16",
             Int32   =>  "p_int32",
             UInt32  =>  "p_uint32",
-            Int64   =>  "p_int64",
-            UInt64  =>  "p_uint64",
+            Int64   =>  "p_int32",
+            UInt64  =>  "p_uint32",
             Float16 =>  "p_float32",
             Float32 =>  "p_float32",
             Float64 =>  "p_float64",
@@ -77,8 +79,8 @@ jToH = Dict(
             UInt16  =>  "Halide::UInt(16)",
             Int32   =>  "Halide::Int(32)",
             UInt32  =>  "Halide::UInt(32)",
-            Int64   =>  "Halide::Int(64)",
-            UInt64  =>  "Halide::UInt(64)",
+            Int64   =>  "Halide::Int(32)",
+            UInt64  =>  "Halide::UInt(32)",
             Float16 =>  "Halide::Float(32)",
             Float32 =>  "Halide::Float(32)",
             Float64 =>  "Halide::Float(64)",
@@ -105,8 +107,8 @@ Variable = Union{SlotNumber, SSAValue, GenSlot}
 const HALIDE_INCLUDE_DIR = "/home/malek/tiramisu/Halide/include"
 const HALIDE_TOOLS_DIR = "/home/malek/tiramisu/Halide/tools"
 const HALIDE_LIB_DIR = "/home/malek/tiramisu/Halide/lib"
-const ISL_INCLUDE_DIR = "/home/malek/tiramisu/isl/build/include"
-const ISL_LIB_DIR = "/home/malek/tiramisu/isl/build/lib"
+const ISL_INCLUDE_DIR = "/home/malek/tiramisu/3rdParty/isl/build/include"
+const ISL_LIB_DIR = "/home/malek/tiramisu/3rdParty/isl/build/lib"
 const TIRAMISU_INCLUDE_DIR = "/home/malek/tiramisu/include"
 const TIRAMISU_BUILD_DIR = "/home/malek/tiramisu/build"
 
@@ -131,6 +133,13 @@ function make_counter()
     end
 end
 
+type Constant
+    id::Int
+end
+
+constant_counter = make_counter()
+new_constant() = Constant(constant_counter())
+
 new_computation_id = make_counter()
 
 genslot_counter = make_counter()
@@ -143,6 +152,24 @@ argNames = Dict(
     TBTemporary => "a_temporary",
 )
 @enum TOpStyle TOpFuncCall TOpInfix
+
+abstract TSig
+
+type InputSig <: TSig
+    var::Variable
+    pos::Int
+end
+
+type InputSizeSig <: TSig
+    var::Variable
+    pos::Int
+end
+
+type OutputSig <: TSig
+    var::Variable
+end
+
+signature = TSig[]
 
 abstract TExpr
 
@@ -183,11 +210,11 @@ end
 
 
 
-type TConstant
+type TConstant <: TExpr
     #constant N("N", e_N, p_int32, true, NULL, 0, &function0);
-    name
+    id::Constant
     expr :: TExpr
-    typ
+    typ::DataType
 end
 
 indexNames = "ijklmnop"
@@ -231,6 +258,8 @@ type JVar <: TVar # Julia Variable
     computation::Union{TComputation, Void} # Might not be there already
 end
 
+copy(x::JVar) = JVar(x.id, x.typ, x.buffer, x.computation)
+
 type DVar <: TVar # Dummy variable TODO remove
     id::GenSlot
 end
@@ -248,16 +277,22 @@ end
 
 abstract TRead <: TExpr
 
+type TLoopVarRead <: TRead
+    var::Variable
+end
+
 type TSimpleRead <: TRead
     var::TVar
 end
 
 type TIndexedRead <: TRead
     var::JVar # TODO should this be a TVar?
-    indices::Vector{Variable}
+    indices::Vector{TExpr}
 end
 
 vars = Dict{Variable, JVar}()
+inputSizeGenvars = Vector{JVar}()
+readGenvars = Vector{JVar}()
 genvars = Vector{JVar}()
 
 idToBufferName(id::SSAValue) = "BSSA" * string(id.id)
@@ -289,6 +324,9 @@ function parseNode(node::Variable)
         throw(UndefVarError(Symbol(node)))
     end
     # TODO: Indexing should not be done here
+    if node in loopVars
+        return TLoopVarRead(node)
+    end
     return TSimpleRead(vars[node])
 end
 
@@ -311,10 +349,12 @@ function parseComputation(expr::TExpr, typ::DataType) # only scalar for now
     if typ <: Primitive
         if isempty(condStack)
             var = new_genslot()
+            push!(loopVars, var)
             dummy(var, IntArch)
-            cond = (wrap(var) == wrap(1))
+            cond = (wrap(var) == wrap(0))
             access = TAccess([wrap(var)], [wrap(0)])
             indices = Variable[var]
+            pop!(loopVars)
         else
             cond = condStack[end]
             access = TAccess(map(wrap, loopVars), [wrap(0)])
@@ -342,7 +382,8 @@ const RootDimension = -1
 SchedLevel = Int
 
 type DelayedSchedule
-    level::SchedLevel
+    current::SchedLevel
+    min::SchedLevel
     time::SchedTime
 end
 
@@ -362,15 +403,18 @@ end
 
 readSchedLevel(level::SchedLevel) = level
 function readSchedLevel(level::DelayedSchedule)
-    if level.time == SchedNext
-        level.time = SchedNow
-        return RootDimension
-    elseif level.time == SchedNow
-        return level.level
-    else
-        # SchedNever
-        return RootDimension
-    end
+    result, level.min = level.min, level.current
+    return result
+    #
+    # if level.time == SchedNext
+    #     level.time = SchedNow
+    #     return level.prev_level
+    # elseif level.time == SchedNow
+    #     return level.level
+    # else
+    #     # SchedNever
+    #     return RootDimension
+    # end
 end
 function readSchedLevel(level::OnceSchedule)
     if level.time == SchedNext
@@ -386,7 +430,7 @@ function readSchedLevel(level::OnceSchedule)
 end
 
 
-sched = ScheduleState(DelayedSchedule(RootDimension, SchedNever),
+sched = ScheduleState(DelayedSchedule(RootDimension, RootDimension, SchedNever),
                       OnceSchedule(RootDimension, SchedNever),
                       nothing, [], nothing, [])
 
@@ -418,8 +462,12 @@ function opToISL(op::String)
     end
 end
 
+
+
 +(args::Vararg{TExpr}) = TOp("", "+", TOpInfix, collect(args), Void)
+*(args::Vararg{TExpr}) = TOp("", "*", TOpInfix, collect(args), Void)
 -(args::Vararg{TExpr}) = TOp("", "-", TOpInfix, collect(args), Void)
+/(args::Vararg{TExpr}) = TOp("", "/", TOpInfix, collect(args), Void)
 ==(args::Vararg{TExpr}) = TOp("", "==", TOpInfix, collect(args), Bool)
 <=(args::Vararg{TExpr}) = TOp("", "<=", TOpInfix, collect(args), Bool)
 and(args::Vararg{TExpr}) = TOp("", "&&", TOpInfix, collect(args), Bool)
@@ -437,7 +485,12 @@ wrap(val::TExpr) = val
 
 wrap(val::Union{Primitive, Variable}) = parseNode(val)
 
-wrap(val::TVar) = TSimpleRead(val)
+function wrap(val::TVar)
+    if val.id in loopVars
+        return TLoopVarRead(val.id)
+    end
+    return TSimpleRead(val)
+end
 
 function wrap(val::Any)
     # Shouldn't have nested calls
@@ -449,10 +502,10 @@ end
 abstract Clause
 
 immutable ForLoop <: Clause
-    id::IntArch
-    from::IntArch
-    to::IntArch
-    inc::IntArch
+    id::Int
+    from::Union{Int, SlotNumber}
+    to::Union{Int, SlotNumber}
+    inc::Int
     var::TVar
 end
 
@@ -464,6 +517,21 @@ loopVars = Vector{Variable}()
 callHandlers = Dict(
     (Core.Intrinsics, :add_int) => function(args::Vector, typ::DataType)
         return typedOp!(+(map(wrap, args)...), typ)
+    end,
+    (Core.Intrinsics, :sub_int) => function(args::Vector, typ::DataType)
+        return typedOp!(-(map(wrap, args)...), typ)
+    end,
+    (Core.Intrinsics, :add_float) => function(args::Vector, typ::DataType)
+        return typedOp!(+(map(wrap, args)...), typ)
+    end,
+    (Core.Intrinsics, :mul_float) => function(args::Vector, typ::DataType)
+        return typedOp!(*(map(wrap, args)...), typ)
+    end,
+    (Core.Intrinsics, :div_float) => function(args::Vector, typ::DataType)
+        return typedOp!(/(map(wrap, args)...), typ)
+    end,
+    (Core.Intrinsics, :sub_float) => function(args::Vector, typ::DataType)
+        return typedOp!(-(map(wrap, args)...), typ)
     end,
     (Core.Intrinsics, :box) => function(args::Vector, typ::DataType)
         return parseNode(args[2])
@@ -481,13 +549,14 @@ callHandlers = Dict(
         var = dummy(varid, IntArch)
         push!(clauseStack, ForLoop(id, from, to, inc, var))
         push!(loopVars, varid)
-        cond = <=(wrap(from), wrap(var), wrap(to))
+        cond = <=(wrap(from) - wrap(1), wrap(var), wrap(to) - wrap(1))
         if isempty(condStack)
             push!(condStack, cond)
         else
             push!(condStack, and(condStack[end], cond))
         end
-        sched.for_level = DelayedSchedule(Unsigned(length(loopVars) - 1), SchedNext)
+    #    sched.for_level = DelayedSchedule(length(loopVars) - 1, sched.for_level.prev_level, SchedNext)
+        sched.for_level = DelayedSchedule(length(loopVars) - 1, sched.for_level.min, SchedNext)
     end,
     (ParallelAccelerator.TiramisuPrepass, :for_loop_end) => function(args::Vector, typ::DataType)
         id = args[1]
@@ -495,42 +564,70 @@ callHandlers = Dict(
         pop!(clauseStack)
         pop!(loopVars)
         pop!(condStack)
-        if isempty(loopVars)
-            sched.for_level = DelayedSchedule(RootDimension, SchedNever)
-        else
-            sched.for_level = DelayedSchedule(Unsigned(length(loopVars) - 1), SchedNow)
-        end
+        # if isempty(loopVars)
+        #     # sched.for_level = DelayedSchedule(RootDimension, RootDimension, SchedNever)
+        #     sched.for_level = DelayedSchedule(RootDimension, RootDimension, SchedNever)
+        # else
+        #     sched.for_level = DelayedSchedule(length(loopVars) - 1, min(sched.for_level.prev_level, length(loopVars) - 1), SchedNext)
+        # end
+        current = length(loopVars) - 1
+        sched.for_level = DelayedSchedule(current, min(current, sched.for_level.min), SchedNext)
     end,
     (ParallelAccelerator.API, :setindex!) => function(args::Vector, typ::DataType)
-        arr = vars[args[1]]
+        arr = copy(vars[args[1]])
         texpr = parseNode(args[2])
         # TODO handle temporal
+        # indices = Variable[]
+        # added_vars = Variable[]
+        # cond = condStack[end]
+        # for arg in args[3:end]
+        #     if isa(arg, Primitive)
+        #         varid = new_genslot()
+        #         var = dummy(varid, Int)
+        #         cond = and(cond, wrap(var) == wrap(arg - 1))
+        #         push!(indices, varid)
+        #         push!(added_vars, varid)
+        #         push!(loopVars, varid)
+        #     else
+        #         push!(indices, arg)
+        #     end
+        # end
         indices = collect(Variable, args[3:end])
         assert(issubset(indices, loopVars)) # TODO more thourough checking
-        access = TAccess(map(wrap, indices), [wrap(i) - wrap(1) for i in indices])
+        access = TAccess(map(wrap, loopVars), [wrap(i) for i in indices])
         comp = TComputation(
             new_computation_id(),
+            # cond,
             condStack[end],
-            length(indices),
+            length(loopVars),
             texpr,
             arr.typ,
             access,
-            indices,
+            copy(loopVars),
             false # TODO fix
         )
+        # for var in added_vars
+        #     pop!(loopVars)
+        # end
         schedule(comp)
         arr.computation = comp
+        push!(used_buffers, arr.buffer.name)
+        push!(genvars, arr)
     end,
     (ParallelAccelerator.API, :getindex) => function(args::Vector, typ::DataType)
         arr = vars[args[1]]
         indices = collect(Variable, args[2:end])
         assert(issubset(indices, loopVars)) # TODO more thourough checking
-        return TIndexedRead(arr, indices)
+        return TIndexedRead(arr, map(wrap, indices))
     end,
 )
 
+function handleReturn(arg::Void, typ::DataType)
+end
+
 function handleReturn(arg::Variable, typ::DataType)
     vars[arg].buffer.argument = TBOutput
+    push!(signature, OutputSig(arg))
 end
 
 function handleReturn(arg, typ::DataType)
@@ -540,7 +637,35 @@ function handleReturn(arg, typ::DataType)
     comp = parseComputation(parseNode(arg), typ)
     vars[id] = JVar(id, typ, buffer, comp)
     push!(genvars, vars[id])
+    push!(signature, OutputSig(id))
 end
+
+function createEmptyComputation(typ, dims, is_scalar)
+    l = length(loopVars)
+    indices = Variable[new_genslot() for _ in dims]
+    append!(loopVars, indices)
+    map(i -> dummy(i, Int), indices)
+    if is_scalar
+        access = TAccess(map(wrap, indices), [wrap(0) for i in indices])
+    else
+        access = TAccess(map(wrap, indices), [wrap(i) for i in indices])
+    end
+    cond = and((<=(wrap(0), wrap(i), wrap(c) - wrap(1))
+                for (i, c) in zip(indices, dims))...)
+    resize!(loopVars, l)
+    return TComputation(
+        new_computation_id(),
+        cond,
+        length(dims),
+        TEmptyExpr(),
+        typ,
+        access,
+        indices,
+        true,
+    )
+end
+
+used_buffers = Set{String}()
 
 function createVar(id, typ, rhs)
     parsed_rhs = parseNode(rhs)
@@ -553,19 +678,130 @@ function createVar(id, typ, rhs)
                     parsed_rhs.typ,
                     TBTemporary,
                     false),
-            nothing
+            createEmptyComputation(parsed_rhs.typ, parsed_rhs.dims, false),
         )
+        push!(readGenvars, vars[id])
+        push!(used_buffers, idToBufferName(id))
     else
-        vars[id] = JVar(
-            id,
-            typ,
-            typToTBuffer[typ](id, typ),
-            parseComputation(parsed_rhs, typ),
-        )
+        if !haskey(vars, id) # in case of reductions
+            vars[id] = JVar(
+                id,
+                typ,
+                typToTBuffer[typ](id, typ),
+                createEmptyComputation(typ, TExpr[wrap(1)], true),
+            )
+            push!(readGenvars, vars[id])
+        end
+        actualComputation = parseComputation(parsed_rhs, typ)
+        newVar = copy(vars[id])
+        newVar.computation = actualComputation
+        push!(genvars, newVar)
     end
-    push!(genvars, vars[id])
 end
 
+function make_const(e::TExpr,
+                    typ::DataType)
+    C = TConstant(
+        new_constant(),
+        e,
+        typ,
+    )
+    return C
+end
+
+
+function createInputSizeVar(n::Int, idx)
+    indices = Variable[new_genslot()]
+    id = new_genslot()
+    map(i -> dummy(i, Int), indices)
+    push!(loopVars, indices[1])
+    access = TAccess(map(wrap, indices), [wrap(indices[1])])
+    cond = <=(wrap(0), wrap(indices[1]), wrap(n) - wrap(1))
+    b = TBuffer(idToBufferName(id),
+                TExpr[wrap(n)],
+                Int,
+                TBInput,
+                false)
+    comp = TComputation(
+        new_computation_id(),
+        cond,
+        n,
+        TEmptyExpr(),
+        Int,
+        access,
+        indices,
+        true,
+    )
+    pop!(loopVars)
+
+    vars[id] = JVar(
+        id,
+        Int,
+        b,
+        comp,
+    )
+    push!(inputSizeGenvars, vars[id])
+    push!(signature, InputSizeSig(id, idx))
+
+    bounds = TExpr[]
+
+    for i in 0:(n-1)
+        push!(bounds, TIndexedRead(vars[id], TExpr[wrap(i)]))
+    end
+
+    return bounds
+end
+
+function createVarInput(id, typ, idx)
+    element_type = eltype(typ)
+    n = ndims(typ)
+    if n == 0
+        indices = Variable[new_genslot()]
+        push!(loopVars, indices[1])
+        map(i -> dummy(i, Int), indices)
+        access = TAccess(map(wrap, indices), [wrap(0)])
+        b = typToTBuffer[typ](id, typ)
+        b.argument = TBInput
+        cond = wrap(indices[1]) == wrap(0)
+        n = 1
+        pop!(loopVars)
+    else
+        bounds = createInputSizeVar(n, idx)
+        l = length(loopVars)
+        indices = Variable[new_genslot() for _ in 1:n]
+        append!(loopVars, indices)
+        map(i -> dummy(i, Int), indices)
+        access = TAccess(map(wrap, indices), [wrap(i) for i in indices])
+        b = TBuffer(idToBufferName(id),
+                    bounds,
+                    element_type,
+                    TBInput,
+                    false)
+        cond = and((<=(wrap(0), wrap(i), wrap(c) - wrap(1))
+                    for (i, c) in zip(indices, bounds))...)
+        resize!(loopVars, l)
+    end
+    comp = TComputation(
+        new_computation_id(),
+        cond,
+        n,
+        TEmptyExpr(),
+        element_type,
+        access,
+        indices,
+        true,
+    )
+
+    vars[id] = JVar(
+        id,
+        eltype(typ),
+        b,
+        comp,
+    )
+
+    push!(readGenvars, vars[id])
+    push!(signature, InputSig(id, idx))
+end
 
 metaHandlers = Dict(
     :parallel => function(args)
@@ -667,18 +903,16 @@ function tiramisu_from_root_entry(body, linfo, functionName::AbstractString)
     run(tiramisu_get_lib_obj())
     run(tiramisu_get_lib())
     #println("Converted to .so file")
-    LIB, get_return()
+    TIRAMISU_BUILD_DIR, LIB, get_return()
 end
 
 
 
 # Converts a buffer to the corresponding type to pass to the C function
-# Example : Buffer(Int32, {2, 3, 4}) becomes Ptr{Ptr{Ptr{Int32}}}
-# But generate Symbol equivalent, i.e. :(Ptr{Ptr{Ptr{Int32}}})
-function buffer_to_ccall_type(buffer)
+function sig_to_ccall_type(sig)
     # need to construct it in this obscure way to be equivalent to
     # the symbol equivalent of writing
-    return :(Ptr{$(buffer.typ)})
+    return :(Ptr{$(vars[sig.var].buffer.typ)})
 end
 
 function buffer_to_ccall_container(buffer)
@@ -695,18 +929,67 @@ function decouple_buffer(containers)
     return containers[1]
 end
 
+function transform_dim(d::TValue, interface, args)
+    return d.val
+end
+
+function transform_dim(d::TSimpleRead, interface, args)
+    sig = [s for s in interface if d.var.id == s.var][1]
+    return args[sig.pos]
+end
+
+function transform_generator()
+    interface = copy(signature)
+    n = length([1 for s in interface if isa(s, InputSig)])
+    outputs = Dict(s => vars[s.var] for s in interface if isa(s, OutputSig))
+    function transform(args)
+        assert(length(args) == n)
+        transformed = []
+        for s in interface
+            if isa(s, InputSizeSig)
+                push!(transformed, collect(Int32, size(args[s.pos])))
+            elseif isa(s, InputSig)
+                arg = args[s.pos]
+                if ndims(arg) == 0
+                    T = eltype(arg)
+                    arg = T[arg]
+                end
+                push!(transformed, arg)
+            else
+                dims = (transform_dim(d, interface, args) for d in outputs[s].buffer.dimensions)
+                push!(transformed, Array{outputs[s].buffer.typ}(dims...))
+            end
+        end
+        return transformed
+    end
+end
+
+function return_parser()
+    interface = copy(signature)
+    returns = []
+    is_scalar = Dict(s => vars[s.var].buffer.is_scalar
+                     for s in interface if isa(s, OutputSig))
+    function get_return(args)
+        dump(args)
+        for (s, arg) in zip(interface, args)
+            if isa(s, OutputSig)
+                if is_scalar[s]
+                    return arg[1]
+                else
+                    return arg
+                end
+            end
+        end
+    end
+end
+
 # returns a tuple of:
 # - A tuple of types; (Ptr{Int32},)...
 # - The corresponding containers in a list
 function get_return()
-    # TODO : handle input
-    interface = [var.buffer for var in genvars if var.buffer.argument == TBOutput]
-    # TODO: handle Tuple return
-    assert(length(interface) == 1)
-    decouple = interface[1].is_scalar ? decouple_scalar : decouple_buffer
-    return (Expr(:tuple, map(buffer_to_ccall_type, interface)...),
-            map(buffer_to_ccall_container, interface),
-            decouple)
+    return (Expr(:tuple, map(sig_to_ccall_type, signature)...),
+            transform_generator(),
+            return_parser())
 end
 
 #Imports for Tiramisu file
@@ -733,6 +1016,12 @@ function tiramisu_from_header(linfo)
         "#include <string>\n",
         "#include <Halide.h>\n\n",
         "using namespace tiramisu;\n\n")
+    params = [vdef for vdef in linfo.var_defs
+                   if vdef.desc == 0 && vdef.name != Symbol("#self#")]
+    for (i, def) in enumerate(params)
+        createVarInput(SlotNumber(def.id), def.typ, i)
+    end
+    return s
 end
 
 #Method Signature for Tiramisu File
@@ -743,6 +1032,7 @@ function tiramisu_set_function(f)
     computationPrefix = f*"_S"
     s = string("int main()\n{\n",
                 "\tglobal::set_default_tiramisu_options();\n",
+                "\tglobal::set_loop_iterator_default_data_type(tiramisu::p_int32);\n",
                 "\tfunction $function_name(\"$function_name\");\n",
                 "\ttiramisu::var ",
                 join(("$v(\"$v\")" for v in indexNames), ", "),
@@ -757,11 +1047,21 @@ getIndices(indices::Vector{TIndex}) = join(map(getIndex, indices), ", ")
 
 VarToString = Dict{Variable, String}
 
+createTExpr(nthg::TEmptyExpr, varMap::VarToString) = "expr()"
+
+createTExpr(c::TConstant, varMap::VarToString) = c.name
+
 createTExpr(val::TValue, varMap::VarToString) = "expr(($(jToC[val.typ])) $(val.val))"
+createTExpr(val::TValue, varMap::VarToString, _, __) = "expr(($(jToC[val.typ])) $(val.val))"
 function createTExpr(var::TSimpleRead, varMap::VarToString)
-    return ("S$(var.var.computation.id)(" *
-            join((varMap[v] for v in var.var.computation.vars), ", ") *
-            ")")
+    return "S$(var.var.computation.id)(0)"
+end
+
+function createTExpr(var::TSimpleRead, varMap::VarToString, constSet, used)
+    pair = Pair{Variable, Int}(var.var.id, 0)
+    name = "C$(constSet[pair].id.id)"
+    push!(used, constSet[pair])
+    return name
 end
 
 function createTExpr(op::TOp, varMap::VarToString)
@@ -771,20 +1071,65 @@ function createTExpr(op::TOp, varMap::VarToString)
     return op.fcn * "(" * join((createTExpr(a, varMap) for a in op.args), ", ") * ")"
 end
 
+function createTExpr(op::TOp, varMap::VarToString, constSet, used)
+    if op.style == TOpInfix
+        return "(" * join((createTExpr(a, varMap, constSet, used) for a in op.args), " $(op.fcn) ") * ")"
+    end
+    return op.fcn * "(" * join((createTExpr(a, varMap, constSet, used) for a in op.args), ", ") * ")"
+end
+
+function createTExpr(var::TLoopVarRead, varMap::VarToString)
+    return varMap[var.var]
+end
+
 function createTExpr(var::TIndexedRead, varMap::VarToString)
+    # TODO why shouldn't this be reversed
     return ("S$(var.var.computation.id)(" *
-            join((varMap[v] for v in var.indices), ", ") *
+            join((createTExpr(v, varMap) for v in var.indices), ", ") *
             ")")
 end
 
-createISLCond(val::TValue, varMap::VarToString) = string(val.val)
-
-function createISLCond(var::TSimpleRead, varMap::VarToString)
-    return varMap[var.var.id]
+function createTExpr(var::TIndexedRead, varMap::VarToString, constSet, used)
+    assert(length(var.indices) == 1 && isa(var.indices[1], TValue))
+    pair = Pair{Variable, Int}(var.var.id, var.indices[1].val)
+    name = "C$(constSet[pair].id.id)"
+    push!(used, constSet[pair])
+    return name
 end
 
-function createISLCond(op::TOp, varMap::VarToString)
-    createCond = arg -> createISLCond(arg, varMap)
+createISLCond(val::TValue, varMap::VarToString, _, __, ___) = string(val.val)
+
+function createISLCond(var::TLoopVarRead, varMap::VarToString, _, __, ___)
+    return varMap[var.var]
+end
+
+function createISLCond(var::TSimpleRead, varMap::VarToString, constSet, createConst, usedConsts)
+    pair = Pair{Variable, Int}(var.var.id, 0)
+    if !haskey(constSet, pair)
+        constSet[pair] = make_const(var, var.var.typ)
+        push!(createConst, constSet[pair])
+    end
+    name = "C$(constSet[pair].id.id)"
+    push!(usedConsts, name)
+    return name
+end
+
+
+function createISLCond(var::TIndexedRead, varMap::VarToString, constSet, createConst, usedConsts)
+    assert(length(var.indices) == 1 && isa(var.indices[1], TValue))
+    pair = Pair{Variable, Int}(var.var.id, var.indices[1].val)
+    if !haskey(constSet, pair)
+        constSet[pair] = make_const(var, var.var.typ)
+        push!(createConst, constSet[pair])
+    end
+    name = "C$(constSet[pair].id.id)"
+    push!(usedConsts, name)
+    return name
+end
+
+function createISLCond(op::TOp, varMap::VarToString,
+                       constSet, createConst, usedConsts)
+    createCond = arg -> createISLCond(arg, varMap, constSet, createConst, usedConsts)
     if op.style == TOpInfix
         return "(" * join(map(createCond, op.args), " $(opToISL(op.fcn)) ") * ")"
     end
@@ -795,30 +1140,41 @@ function getIndices(comp::TComputation)
     return join(indexNames[1:length(comp.vars)], ", ")
 end
 
-function createISL(comp::TComputation, varMap::VarToString)
+function createISL(comp::TComputation, varMap::VarToString, constSet, createConst)
     for (var, index) in zip(comp.vars, indexNames)
         varMap[var] = string(index)
     end
-    cond = createISLCond(comp.condition, varMap)
+    usedConsts = Set{String}()
+    # dump(comp)
+    # dump(comp.vars)
+    cond = createISLCond(comp.condition, varMap, constSet, createConst, usedConsts)
+    usedConsts = join(usedConsts, ", ")
     indices = getIndices(comp)
-    return "{S$(comp.id)[$indices] : $cond}"
+    return "[$(usedConsts)] -> {S$(comp.id)[$indices] : $cond}"
 end
 
-function createAccess(access::Vector{TExpr}, varMap)
-    return join((createISLCond(expr, varMap) for expr in access), ",")
+function createAccess(access::Vector{TExpr}, varMap, constSet, createConst)
+    return join((createISLCond(expr, varMap, constSet, createConst, Set{String}()) for expr in access), ",")
 end
 
-function createAccess(comp::TComputation, varMap::VarToString)
+function createAccess(comp::TComputation, varMap::VarToString, constSet, createConst)
     for (var, index) in zip(comp.vars, indexNames)
         varMap[var] = string(index)
     end
-    return (createAccess(comp.access.computation, varMap),
-            createAccess(comp.access.buffer, varMap))
+    return (createAccess(comp.access.computation, varMap, constSet, createConst),
+            createAccess(reverse(comp.access.buffer), varMap, constSet, createConst))
 end
 
 createSchedLevel(level::SchedLevel) = ((level == RootDimension) ?
-                                       "tiramisu::computation::root_dimension" :
-                                       "$level")
+                                       "tiramisu::computation::root" :
+                                       indexNames[level + 1]) # Julia is 1 indexed
+
+function get_arg_type(buffer)
+    if buffer.name in used_buffers && buffer.argument == TBInput
+        return argNames[TBOutput]
+    end
+    return argNames[buffer.argument]
+end
 
 function tiramisu_analyze_body(ast::Expr, linfo)
     # dump(ast.args)
@@ -830,32 +1186,115 @@ function tiramisu_analyze_body(ast::Expr, linfo)
     uvars = unique(genvars)
     # computation pass
     lines = Vector{String}()
+    constSet = Dict{Pair{Variable, Int}, TConstant}()
 
-    println("Computation")
-    computations = sort([var.computation for var in uvars], by=(c -> c.id))
-    for computation in computations
+    println("Input Computations")
+    for v in inputSizeGenvars
+        computation = v.computation
         varMap = VarToString()
+        createConst = TConstant[]
         push!(lines,
               "\ttiramisu::computation S$(computation.id)(" *
-              "\"" * createISL(computation, varMap) * "\", " *
+              "\"" * createISL(computation, varMap, constSet, createConst) * "\", " *
               createTExpr(computation.expr, varMap) * ", " *
               string(!computation.is_input) * ", " *
               jToT[computation.typ] * ", " *
               "&$function_name);")
     end
-    println("Buffers")
-    for var in uvars
+    # for c in consts
+    #     varMap = VarToString()
+    #     push!(lines,
+    #           "\ttiramisu::constant $(c.name)(" *
+    #           "\"$(c.name)\", " *
+    #           createTExpr(c.expr, varMap) * ", " *
+    #           jToT[c.typ] * ", " *
+    #           "true, " *
+    #           "nullptr, " *
+    #           "0, " *
+    #           "&$function_name);")
+    # end
+    println("Read Computation")
+    computations = sort([var.computation for var in readGenvars], by=(c -> c.id))
+    for computation in computations
         varMap = VarToString()
-        cIndices, bIndices = createAccess(var.computation, varMap)
+        createConst = TConstant[]
+        # dump(computation)
+        result = (
+              "\ttiramisu::computation S$(computation.id)(" *
+              "\"" * createISL(computation, varMap, constSet, createConst) * "\", " *
+              createTExpr(computation.expr, varMap) * ", " *
+              "false, " *
+              jToT[computation.typ] * ", " *
+              "&$function_name);")
+        for c in createConst
+            varMap = VarToString()
+            push!(lines,
+                  "\ttiramisu::constant C$(c.id.id)(" *
+                  "\"C$(c.id.id)\", " *
+                  createTExpr(c.expr, varMap) * ", " *
+                  jToT[c.typ] * ", " *
+                  "true, " *
+                  "nullptr, " *
+                  "0, " *
+                  "&$function_name);")
+        end
+        push!(lines, result)
+    end
+    println("Computation")
+    computations = sort([var.computation for var in uvars], by=(c -> c.id))
+    for computation in computations
+        # dump(computation)
+        varMap = VarToString()
+        createConst = TConstant[]
+        result = (
+              "\ttiramisu::computation S$(computation.id)(" *
+              "\"" * createISL(computation, varMap, constSet, createConst) * "\", " *
+              createTExpr(computation.expr, varMap) * ", " *
+              string(!computation.is_input) * ", " *
+              jToT[computation.typ] * ", " *
+              "&$function_name);")
+        for c in createConst
+            varMap = VarToString()
+            push!(lines,
+                  "\ttiramisu::constant C$(c.id.id)(" *
+                  "\"C$(c.id.id)\", " *
+                  createTExpr(c.expr, varMap) * ", " *
+                  jToT[c.typ] * ", " *
+                  "true, " *
+                  "nullptr, " *
+                  "0, " *
+                  "&$function_name);")
+        end
+        push!(lines, result)
+    end
+    println("Buffers")
+    buffers_to_allocate = TBuffer[]
+    buffers_to_allocate_lets = Set[]
+    for var in vcat(inputSizeGenvars, readGenvars)
+        varMap = VarToString()
+        createConst = TConstant[]
+        cIndices, bIndices = createAccess(var.computation, varMap, constSet, createConst)
+        used = Set()
         push!(lines,
               "\ttiramisu::buffer $(var.buffer.name)(" *
               "\"$(var.buffer.name)\", " *
-              string(length(var.buffer.dimensions)) * ", " *
-              "{" * join((createTExpr(d, varMap) for d in var.buffer.dimensions), ", ") * "}, " *
+              "{" * join((createTExpr(d, varMap, constSet, used) for d in var.buffer.dimensions), ", ") * "}, " *
               jToT[var.buffer.typ] * ", " *
-              "NULL, " *
-              argNames[var.buffer.argument] * ", " *
+              get_arg_type(var.buffer) * ", " *
               "&$function_name);")
+        push!(lines,
+              "\tS$(var.computation.id).set_access(\"" *
+              "{S$(var.computation.id)[$cIndices] -> $(var.buffer.name)[$bIndices]}" *
+              "\");")
+        if !isempty(used) && var.buffer.argument == TBTemporary
+            push!(buffers_to_allocate, var.buffer)
+            push!(buffers_to_allocate_lets, used)
+        end
+    end
+    for var in uvars
+        varMap = VarToString()
+        createConst = TConstant[]
+        cIndices, bIndices = createAccess(var.computation, varMap, constSet, createConst)
         push!(lines,
               "\tS$(var.computation.id).set_access(\"" *
               "{S$(var.computation.id)[$cIndices] -> $(var.buffer.name)[$bIndices]}" *
@@ -863,18 +1302,57 @@ function tiramisu_analyze_body(ast::Expr, linfo)
     end
     # Scheduling
     println("Scheduling")
+    # const_sched_list = collect(values(constSet))
+    # for (i, (b, cs)) in enumerate(zip(buffers_to_allocate, buffers_to_allocate_lets))
+    #
+    #     if i == 1
+    #         push!(lines, "\ttiramisu::computation* _allocate_$(b.name) = $(b.name).allocate_at(S$(sched.schedule[1].first.first.id), tiramisu::computation::root_dimension);");
+    #     else
+    #         push!(lines, "\ttiramisu::computation* _allocate_$(b.name) = $(b.name).allocate_at(*_allocate_$(buffers_to_allocate[i - 1].name), tiramisu::computation::root_dimension);");
+    #     end
+    #     varMap = VarToString()
+    #     for c in cs
+    #         push!(lines, "\t_allocate_$(b.name)->add_associated_let_stmt(\"C$(c.id.id)\", $(createTExpr(c.expr, varMap)));");
+    #     end
+    # end
+    # # push!(const_sched_list, sched.schedule[1].first.first)
+    # reverse!(buffers_to_allocate)
+    # for i in 1:(length(const_sched_list) - 1)
+    #     (c1, c2) = (const_sched_list[i], const_sched_list[i + 1])
+    #     push!(lines, "\tC$(c2.id.id).after(C$(c1.id.id), tiramisu::computation::root);")
+    # end
+    # if !isempty(buffers_to_allocate)
+    #     cnst = const_sched_list[end]
+    #     b = buffers_to_allocate[1]
+    #     push!(lines, "\t_allocate_$(b.name)->after(C$(cnst.id.id), tiramisu::computation::root);")
+    #     for i in 1:(length(buffers_to_allocate) - 1)
+    #         (b1, b2) = (buffers_to_allocate[i], buffers_to_allocate[i + 1])
+    #         push!(lines, "\t_allocate_$(b2.name)->after(*_allocate_$(b1.name), tiramisu::computation::root);")
+    #     end
+    #     if !isempty(sched.schedule)
+    #         b = buffers_to_allocate[end]
+    #         comp = sched.schedule[1].first.first
+    #         push!(lines, "\tS$(comp.id).after(*_allocate_$(b.name), tiramisu::computation::root);")
+    #     end
+    # elseif !isempty(const_sched_list) && !isempty(sched.schedule)
+    #     cnst = const_sched_list[end]
+    #     comp = sched.schedule[1].first.first
+    #     push!(lines, "\tS$(comp.id).after(C$(cnst.id.id), tiramisu::computation::root);")
+    # end
     for ((c1, c2), level) in sched.schedule
+        # level = Int(c2.dim) - level - 1
         push!(lines, "\tS$(c2.id).after(S$(c1.id), $(createSchedLevel(level)));")
     end
 
     for (c, level) in sched.parallelize
-        push!(lines, "\tS$(c.id).tag_parallel_level($level);")
+        # level = Int(c.dim) - level - 1
+        push!(lines, "\tS$(c.id).tag_parallel_level($(createSchedLevel(level)));")
     end
 
 
 
     println("Interface")
-    interface = [var.buffer.name for var in uvars if var.buffer.argument != TBTemporary]
+    interface = [vars[s.var].buffer.name for s in signature]
     push!(lines, "\t$function_name.set_arguments({" *
                   join(map(s -> "&" * s, interface), ", ")
                   *"});")
@@ -888,17 +1366,25 @@ end
 
 function buffer_to_arg_prototype(buffer)
     return (jToC[buffer.typ] *
-            repeat("*", length(buffer.dimensions)) *
-            " $(buffer.name)")
+            # repeat("*", length(buffer.dimensions)) *
+            "* $(buffer.name)")
+end
+
+getdim(dim::TValue) = dim.val
+getdim(dim::TSimpleRead) = "$(dim.var.buffer.name)[0]"
+function getdim(dim::TIndexedRead)
+    name = dim.var.buffer.name
+    indices = join(("$(i.val)" for i in dim.indices), ", ")
+    return "$name[$indices]"
 end
 
 function buffer_to_halide_buffer(buffer)
     lines = String[]
     push!(lines,
           "auto *shape_$(buffer.name) = new halide_dimension_t[$(length(buffer.dimensions))];")
-    for (i, dim) in enumerate(buffer.dimensions)
+    for (i, dim) in enumerate(reverse(buffer.dimensions))
         push!(lines, "shape_$(buffer.name)[$(i - 1)].min = 0;")
-        push!(lines, "shape_$(buffer.name)[$(i - 1)].extent = $(dim.val);") # TODO not always TValue
+        push!(lines, "shape_$(buffer.name)[$(i - 1)].extent = $(getdim(dim));") # TODO not always TValue
         push!(lines, "shape_$(buffer.name)[$(i - 1)].stride = 1;")
     end
     push!(lines, "Halide::Buffer<> " *
@@ -921,7 +1407,7 @@ function generate_wrapper()
     push!(lines, "int main(int, char**) {")
     push!(lines, "return 0;")
     push!(lines, "}")
-    interface = [var.buffer for var in genvars if var.buffer.argument != TBTemporary]
+    interface = [vars[s.var].buffer for s in signature]
     push!(lines, "extern \"C\" int $function_name(" * join(("halide_buffer_t *" for _ in interface), ", ") * ");")
     push!(lines, "#pragma GCC visibility push(default)")
     push!(lines, "extern \"C\" void $(function_name)_wrapper(" *
@@ -943,17 +1429,11 @@ end
 #Returns the command to compile the written Tiramisu file
 function tiramisu_get_command()
     s = ["g++","-g","-std=c++11","-O3","-Wall","-Wno-sign-compare","-fno-rtti","-fvisibility=hidden","-fPIC"]
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_core.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_halide.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_c.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_debug.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_utils.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_halide_lowering.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_from_halide.o")
     push!(s,"$FILENAME","-o","$GEN","-I$TIRAMISU_INCLUDE_DIR")
     push!(s,"-I$ISL_INCLUDE_DIR")
     push!(s,"-I/usr/local/include","-I$HALIDE_INCLUDE_DIR")
     push!(s,"-I$HALIDE_TOOLS_DIR","-I$TIRAMISU_BUILD_DIR")
+    push!(s,"-L$TIRAMISU_BUILD_DIR", "-ltiramisu")
     push!(s,"-L$ISL_LIB_DIR")
     push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_LIB_DIR","-lHalide","-ldl")
     push!(s,"-lpthread","-lz","-ljpeg","-ltinfo")#`libpng-config --cflags --ldflags`","-ljpeg")
@@ -987,6 +1467,7 @@ function tiramisu_get_lib_obj()
     push!(s,"-I/usr/local/include","-I$HALIDE_INCLUDE_DIR")
     push!(s,"-I$HALIDE_TOOLS_DIR","-I$TIRAMISU_BUILD_DIR")
     push!(s,"-L$ISL_LIB_DIR")
+    push!(s,"-L$TIRAMISU_BUILD_DIR", "-ltiramisu")
     push!(s,"-L/usr/local/lib","-lisl","-lgmp","-L$HALIDE_LIB_DIR","-lHalide","-ldl")
     push!(s,"-lpthread","-lz","-ljpeg","-ltinfo")#`libpng-config --cflags --ldflags`","-ljpeg")
     push!(s,"$FILENAME_WRAPPER")
@@ -999,13 +1480,6 @@ end
 #code stored in libraries as opposed to object files
 function tiramisu_get_lib()
     s = ["g++","-g","-std=c++11","-O3","-Wall","-Wno-sign-compare","-fno-rtti","-fvisibility=hidden","-fPIC"]
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_core.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_halide.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_c.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_debug.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_utils.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_halide_lowering.o")
-    push!(s,"$TIRAMISU_BUILD_DIR/tiramisu_codegen_from_halide.o")
     push!(s,OBJ)
     push!(s,OBJ_WRAPPER)
     push!(s,"-I$TIRAMISU_INCLUDE_DIR")

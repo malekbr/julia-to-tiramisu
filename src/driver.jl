@@ -448,18 +448,38 @@ function toTiramisu(func :: GlobalRef, code, signature :: Tuple)
   else
     linfo, body = lambdaToLambdaVarInfo(code)
   end
-  dyn_lib, (types, containers, decouple) = Tiramisu.tiramisu_from_root_entry(body,linfo,function_name_string)
+  lib_path, dyn_lib, (types, transform, get_return) = Tiramisu.tiramisu_from_root_entry(body,linfo,function_name_string)
   proxy_name = function_name_string
   proxy_sym = gensym(proxy_name)
 
-  proxy_func = @eval function ($proxy_sym)()
-    lib = Libdl.dlopen($dyn_lib)
-    func_sym = Symbol($function_name_string * "_wrapper")
-    func = Libdl.dlsym(lib, func_sym)
-    tic()
-    ccall(func, Void, $types, $containers...)
-    println("Execution time ", toq())
-    return $decouple($containers)
+  containers = Expr(:tuple, (gensym() for _ in eval(types))...)
+
+  proxy_func_inner = eval(Expr(:function, containers,
+    :(begin
+      lib = Libdl.dlopen($dyn_lib)
+      func_sym = Symbol($function_name_string * "_wrapper")
+      func = Libdl.dlsym(lib, func_sym)
+      tic()
+      $(Expr(
+        :ccall,
+        :func,
+        :Void,
+        types,
+        containers.args...
+      ))
+      println("Execution time ", toq())
+    end)))
+
+  function local_scope_catcher(args)
+    args = transform(args)
+    # print(args)
+    # print(types)
+    proxy_func_inner(args...)
+    return get_return(args)
+  end
+
+  proxy_func = @eval function $(proxy_sym)(args...)
+    return $(local_scope_catcher)(args)
   end
 
   off_time = time_ns() - off_time_start

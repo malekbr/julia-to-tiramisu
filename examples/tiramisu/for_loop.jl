@@ -6,7 +6,7 @@ using ParallelAccelerator
   B = Array{Int8}(10000, 10000)
   C = Array{Int8}(10000, 10000)
   D = Array{Int8}(10000, 10000)
-  @tagparallel for i = 1:10000
+  for i = 1:10000
     for j = 1:10000
       @fuse 2 A[i, j] = Int8(0)
     end

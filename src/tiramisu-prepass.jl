@@ -97,8 +97,9 @@ end
 
 type ForLoopData <: State
   id::Union{Void, Integer} # assigned id
-  from::Union{Void, Integer} # lower bound of loop
-  to::Union{Void, Integer} # upper bound of loop
+  from::Union{Void, Integer, SlotNumber} # lower bound of loop
+  ssa_from::Union{Void, SSAValue} # lower bound of loop
+  to::Union{Void, Integer, SlotNumber} # upper bound of loop
   protec_to::Union{Void, SSAValue} # Computed upper bound of loop
   loop_var::Union{Void, SlotNumber} # Actual loop variable
   used_loop_var::Union{Void, SlotNumber} # Exposed loop variable (if variable is used)
@@ -112,6 +113,13 @@ type ForLoopData <: State
   bottom_index::Union{Void, Integer} # Index of Goto at loop end
 end
 
+function process(state::ForLoopData, expr)
+  if expr === state.ssa_from
+    return state.from
+  end
+  return expr
+end
+
 isForLoopMeta = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
   is_valid = expr.head === :meta && expr.args[1] === :forloop
 
@@ -119,6 +127,15 @@ isForLoopMeta = onlyExpr(function(expr::Expr, index::Integer, state::NoState)
     state = ForLoopData(repeated(nothing, length(fieldnames(ForLoopData)))...)
     state.id = expr.args[2]
     state.header_index = index
+    return true, state
+  end
+  return false, NoState()
+end)
+
+isForLoopSSAFrom = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
+  if expr.head === :(=) && isa(expr.args[1], SSAValue) && isa(expr.args[2], SlotNumber)
+    state.ssa_from = expr.args[1]
+    state.from = expr.args[2]
     return true, state
   end
   return false, NoState()
@@ -191,7 +208,7 @@ end)
 isForLoopVarInit = onlyExpr(function(expr::Expr, index::Integer, state::ForLoopData)
   is_valid = (expr.head === :(=) &&
               isa(expr.args[1], SlotNumber) &&
-              expr.args[2] === state.from)
+              process(state, expr.args[2]) === process(state, state.from))
   state.loop_var = expr.args[1]
   return is_valid, state
 end)
@@ -508,6 +525,26 @@ for_loop_unused_pattern = Pattern([isForLoopMeta,
                                    isForLoopTestGoto,
                                    isForLoopVarInc,
                                    isForLoopUpdateVar], forLoopHeaderValidator)
+
+for_loop_used_pattern_ssa = Pattern([isForLoopMeta,
+                                 isForLoopSSAFrom,
+                                 isForLoopHeader,
+                                 isForLoopVarInit,
+                                 isForLoopBeginLabel,
+                                 isForLoopTestGoto,
+                                 isForLoopVarSave,
+                                 isForLoopVarInc,
+                                 isForLoopUsedVar,
+                                 isForLoopUpdateVar], forLoopHeaderValidator)
+
+for_loop_unused_pattern_ssa = Pattern([isForLoopMeta,
+                                     isForLoopSSAFrom,
+                                     isForLoopHeader,
+                                     isForLoopVarInit,
+                                     isForLoopBeginLabel,
+                                     isForLoopTestGoto,
+                                     isForLoopVarInc,
+                                     isForLoopUpdateVar], forLoopHeaderValidator)
 if_pattern = Pattern([isIfMeta, isIfGotoIfNot], ifValidator)
 
 continue_pattern = Pattern([isContinueMeta, isContinueGoto], continueValidator)
@@ -516,15 +553,25 @@ endif_pattern = Pattern([isEndifMeta, isEndifLabel], endifValidator)
 
 else_pattern = Pattern([isElseGoto, isElseLabel, isElseMeta], elseValidator)
 
-patterns = [for_loop_used_pattern, for_loop_unused_pattern, if_pattern,
+patterns = [for_loop_used_pattern, for_loop_unused_pattern,
+            for_loop_used_pattern_ssa, for_loop_unused_pattern_ssa,
+            if_pattern,
             continue_pattern, endif_pattern, else_pattern] #, for_loop_test_pattern]
 
 changers = [for_loop_changer, if_changer, continue_changer, endif_changer,
             else_changer]
 
 function detector(ast::Expr)
+  clean!(ast)
   detector(ast, patterns)
   change!(ast, changers)
+end
+
+function clean!(ast)
+    ast.args = [e for e in ast.args if !(
+                  isa(e, LineNumberNode) ||
+                  isa(e, NewvarNode) ||
+                  isa(e, Slot))]
 end
 
 function change!(ast::Expr, changers::Vector{Changer})
@@ -539,6 +586,9 @@ function change!(ast::Expr, changers::Vector{Changer})
       push!(new_args, e)
     end
   end
+  # for e in new_args
+  #   dump(e)
+  # end
   ast.args = new_args
 end
 
@@ -554,9 +604,7 @@ function detector(ast::Expr, patterns::Vector{Pattern})
   states = State[NoState() for state in patterns]
   indices = [1 for expr in patterns]
   for (e_i, expr) in enumerate(ast.args)
-    if isa(expr, LineNumberNode)
-      continue
-    end
+    # dump(expr)
     for (p_i, pattern) in enumerate(patterns)
       @label pattern_check
       matched, state, future = call_matcher(pattern.matchers[indices[p_i]],
